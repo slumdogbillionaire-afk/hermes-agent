@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from telegram import ReactionTypeEmoji
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome
@@ -96,7 +97,7 @@ async def test_set_reaction_calls_bot_api(monkeypatch):
     adapter._bot.set_message_reaction.assert_awaited_once_with(
         chat_id=123,
         message_id=456,
-        reaction="\U0001f440",
+        reaction=[ReactionTypeEmoji("\U0001f440")],
     )
 
 
@@ -137,7 +138,7 @@ async def test_on_processing_start_adds_eyes_reaction(monkeypatch):
     adapter._bot.set_message_reaction.assert_awaited_once_with(
         chat_id=123,
         message_id=456,
-        reaction="\U0001f440",
+        reaction=[ReactionTypeEmoji("\U0001f440")],
     )
 
 
@@ -175,7 +176,7 @@ async def test_on_processing_start_handles_missing_ids(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_on_processing_complete_success(monkeypatch):
-    """Successful processing should set thumbs-up reaction."""
+    """Successful delivery should set Telegram's supported thumbs-up reaction."""
     monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
     adapter = _make_adapter()
     event = _make_event()
@@ -185,13 +186,13 @@ async def test_on_processing_complete_success(monkeypatch):
     adapter._bot.set_message_reaction.assert_awaited_once_with(
         chat_id=123,
         message_id=456,
-        reaction="\U0001f44d",
+        reaction=[ReactionTypeEmoji("\U0001f44d")],
     )
 
 
 @pytest.mark.asyncio
 async def test_on_processing_complete_failure(monkeypatch):
-    """Failed processing should set thumbs-down reaction."""
+    """Failed processing or delivery should set Telegram's supported thumbs-down."""
     monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
     adapter = _make_adapter()
     event = _make_event()
@@ -201,7 +202,7 @@ async def test_on_processing_complete_failure(monkeypatch):
     adapter._bot.set_message_reaction.assert_awaited_once_with(
         chat_id=123,
         message_id=456,
-        reaction="\U0001f44e",
+        reaction=[ReactionTypeEmoji("\U0001f44e")],
     )
 
 

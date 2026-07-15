@@ -3564,6 +3564,88 @@ class TelegramAdapter(BasePlatformAdapter):
         else:  # "first" (default)
             return chunk_index == 0
 
+    _D065_CODE_RE = re.compile(r"\bapprove\s+([0-9a-f]{6})\b", re.IGNORECASE)
+
+    # Steward pin (settings-wiring Step 2, Ember's pre-ship react): approvals
+    # whose action_key is listed here lower a MASTER guardrail, so the general
+    # Telegram allowlist (which may legitimately grow — family access,
+    # loaners) is NOT sufficient authority: the tapping user must be Adam
+    # himself. Same pinned id as the guard-protected telegram-approval /
+    # learning-review plugins (channel_directory.json, 2026-07-07). Keep in
+    # sync with _PHONE_ONLY_GRANT_KEYS in control_panel/app.py until the
+    # Step-3 registry centralizes tier policy.
+    _D065_STEWARD_ID = "7758316507"
+    _D065_STEWARD_ONLY_KEYS = frozenset({"master.unfreeze"})
+
+    @staticmethod
+    def _d065_may_approve(action_key: str, caller_id: str) -> bool:
+        """Approve-authorization for a RESOLVED da: request. Steward-only keys
+        require Adam's exact user id and FAIL CLOSED on an absent/malformed
+        pin. Every other key keeps the existing general-allowlist policy (the
+        caller already passed _is_callback_user_authorized). Deny is never
+        gated here — refusing only keeps a guardrail up."""
+        if action_key not in TelegramAdapter._D065_STEWARD_ONLY_KEYS:
+            return True
+        steward = str(TelegramAdapter._D065_STEWARD_ID or "").strip()
+        if not steward.isdigit():
+            return False  # no valid pin -> nobody can approve this key
+        return str(caller_id).strip() == steward
+
+    async def _try_attach_d065_buttons(
+        self, chat_id: str, content: str, reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> Optional["SendResult"]:
+        """If this outbound message is Ember reporting a D-065 gated-action
+        block (contains 'approve <6-hex-code>'), look up the matching pending
+        request and send real inline Approve/Deny buttons instead of plain
+        text — Adam taps instead of retyping the code. Falls through (returns
+        None) if there's no match, the request already resolved, or anything
+        errors — the caller then sends the plain text as normal. This never
+        creates or resolves a grant itself; only _handle_callback_query does.
+        """
+        m = self._D065_CODE_RE.search(content or "")
+        if not m:
+            return None
+        code = m.group(1).lower()
+        try:
+            import sys as _s
+            _sysdir = r"C:\Users\Adam\companion-home\system"
+            if _sysdir not in _s.path:
+                _s.path.insert(0, _sysdir)
+            import approvals as _ap
+            pending = _ap.list_requests("pending")
+            target = next((r for r in pending if r["id"].lower().endswith(code)), None)
+            if not target:
+                return None
+
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ APPROVE", callback_data=f"da:approve:{target['id']}"),
+                InlineKeyboardButton("❌ DENY", callback_data=f"da:deny:{target['id']}"),
+            ]])
+            preview = self.format_message(content if len(content) <= 3800 else content[:3800] + "...")
+            thread_id = self._metadata_thread_id(metadata)
+            kwargs: Dict[str, Any] = {
+                "chat_id": normalize_telegram_chat_id(chat_id),
+                "text": preview,
+                "parse_mode": ParseMode.MARKDOWN_V2,
+                "reply_markup": keyboard,
+                **self._link_preview_kwargs(),
+            }
+            reply_to_id = self._reply_to_message_id_for_send(reply_to, metadata, reply_to_mode=self._reply_to_mode)
+            kwargs["reply_to_message_id"] = reply_to_id
+            kwargs.update(
+                self._thread_kwargs_for_send(
+                    chat_id, thread_id, metadata,
+                    reply_to_message_id=reply_to_id,
+                    reply_to_mode=self._reply_to_mode,
+                )
+            )
+            msg = await self._send_message_with_thread_fallback(**kwargs)
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as exc:
+            logger.debug("D-065 button attach skipped (falling back to text): %s", exc)
+            return None
+
     async def send(
         self,
         chat_id: str,
@@ -3582,6 +3664,14 @@ class TelegramAdapter(BasePlatformAdapter):
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
+
+        # D-065 tap-to-approve: if this text mentions "approve <code>" for a
+        # still-pending request, send real inline buttons instead of plain
+        # text so Adam can tap rather than retype. No-op / falls through to
+        # normal send on any mismatch or error.
+        d065_result = await self._try_attach_d065_buttons(chat_id, content, reply_to, metadata)
+        if d065_result is not None:
+            return d065_result
         
         try:
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
@@ -5328,6 +5418,53 @@ class TelegramAdapter(BasePlatformAdapter):
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
 
+        # --- Plugin-registered callbacks -----------------------------------
+        # Generic edge extension point, mirroring Slack's plugin action
+        # handlers. Authorization stays in the adapter so a plugin cannot
+        # accidentally expose a callback to an untrusted Telegram user.
+        try:
+            from hermes_cli.plugins import get_plugin_manager
+
+            plugin_handlers = get_plugin_manager().get_telegram_callback_handlers()
+        except Exception as exc:
+            logger.debug("[%s] Telegram plugin callback discovery failed: %s", self.name, exc)
+            plugin_handlers = []
+
+        for callback_prefix, callback, plugin_name in plugin_handlers:
+            if not data.startswith(callback_prefix):
+                continue
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to use this action.")
+                return
+            try:
+                result = callback(
+                    query=query,
+                    data=data,
+                    adapter=self,
+                    context=context,
+                )
+                if inspect.isawaitable(result):
+                    result = await result
+            except Exception as exc:
+                logger.error(
+                    "[%s] Telegram plugin callback failed (%s): %s",
+                    self.name,
+                    plugin_name,
+                    exc,
+                    exc_info=True,
+                )
+                await query.answer(text="⚠️ That action failed. Please try again.")
+                return
+            if result:
+                return
+
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):
             chat_id = str(query.message.chat_id) if query.message else None
@@ -5345,6 +5482,71 @@ class TelegramAdapter(BasePlatformAdapter):
                 query_thread_id=query_thread_id,
                 query_user_name=query_user_name,
             )
+            return
+
+        # --- D-065 tap-to-approve callbacks (da:choice:request_id) ---
+        if data.startswith("da:"):
+            parts = data.split(":", 2)
+            if len(parts) == 3:
+                choice = parts[1]  # approve, deny
+                request_id = parts[2]
+
+                caller_id = str(getattr(query.from_user, "id", ""))
+                if not self._is_callback_user_authorized(
+                    caller_id,
+                    chat_id=query_chat_id,
+                    chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                    thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                    user_name=query_user_name,
+                ):
+                    await query.answer(text="⛔ You are not authorized to approve this.")
+                    return
+
+                user_display = getattr(query.from_user, "first_name", "Adam")
+                try:
+                    import sys as _s
+                    _sysdir = r"C:\Users\Adam\companion-home\system"
+                    if _sysdir not in _s.path:
+                        _s.path.insert(0, _sysdir)
+                    import approvals as _ap
+                    target = next((r for r in _ap.list_requests()
+                                   if r["id"] == request_id), None)
+                    if target is None:
+                        await query.answer(text="This request has already been resolved or expired.")
+                        return
+                    if choice == "approve":
+                        # Steward-only keys (master.unfreeze): Adam himself,
+                        # not merely any allowlisted Telegram user.
+                        if not self._d065_may_approve(
+                                str(target.get("action_key", "")), caller_id):
+                            await query.answer(text="⛔ Only Adam himself can approve this one.")
+                            return
+                        result = _ap.grant(request_id)
+                        label = "✅ Approved"
+                    elif choice == "deny":
+                        result = _ap.deny(request_id)
+                        label = "❌ Denied"
+                    else:
+                        await query.answer(text="Invalid action.")
+                        return
+                    if not result:
+                        await query.answer(text="This request has already been resolved or expired.")
+                        return
+                    desc = result.get("description", "the pending action")
+                except Exception as exc:
+                    logger.error("Failed to resolve D-065 approval from Telegram button: %s", exc)
+                    await query.answer(text="Error resolving this request — try replying with text instead.")
+                    return
+
+                await query.answer(text=label)
+                try:
+                    await query.edit_message_text(
+                        text=self.format_message(f"{label} by {user_display}: {desc}"),
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass  # non-fatal if edit fails
             return
 
         # --- Exec approval callbacks (ea:choice:id) ---
@@ -8501,10 +8703,12 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return False
         try:
+            from telegram import ReactionTypeEmoji
+
             await self._bot.set_message_reaction(
                 chat_id=normalize_telegram_chat_id(chat_id),
                 message_id=int(message_id),
-                reaction=emoji,
+                reaction=[ReactionTypeEmoji(emoji)],
             )
             return True
         except Exception as e:
