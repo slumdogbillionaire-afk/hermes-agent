@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from telegram import ReactionTypeEmoji
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome
@@ -68,11 +69,39 @@ async def test_set_reaction_calls_bot_api(monkeypatch):
     adapter._bot.set_message_reaction.assert_awaited_once_with(
         chat_id=123,
         message_id=456,
-        reaction="\U0001f440",
+        reaction=[ReactionTypeEmoji("\U0001f440")],
     )
 
 
 # ── on_processing_start ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_on_processing_start_adds_eyes_reaction(monkeypatch):
+    """Processing start should add eyes reaction when enabled."""
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    adapter = _make_adapter()
+    event = _make_event()
+
+    await adapter.on_processing_start(event)
+
+    adapter._bot.set_message_reaction.assert_awaited_once_with(
+        chat_id=123,
+        message_id=456,
+        reaction=[ReactionTypeEmoji("\U0001f440")],
+    )
+
+
+@pytest.mark.asyncio
+async def test_on_processing_start_skipped_when_disabled(monkeypatch):
+    """Processing start should not react when reactions are disabled."""
+    monkeypatch.delenv("TELEGRAM_REACTIONS", raising=False)
+    adapter = _make_adapter()
+    event = _make_event()
+
+    await adapter.on_processing_start(event)
+
+    adapter._bot.set_message_reaction.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -93,6 +122,50 @@ async def test_on_processing_start_handles_missing_ids(monkeypatch):
 
 
 # ── on_processing_complete ───────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_on_processing_complete_success(monkeypatch):
+    """Successful delivery should set Telegram's supported thumbs-up reaction."""
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    adapter = _make_adapter()
+    event = _make_event()
+
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    adapter._bot.set_message_reaction.assert_awaited_once_with(
+        chat_id=123,
+        message_id=456,
+        reaction=[ReactionTypeEmoji("\U0001f44d")],
+    )
+
+
+@pytest.mark.asyncio
+async def test_on_processing_complete_failure(monkeypatch):
+    """Failed processing or delivery should set Telegram's supported thumbs-down."""
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    adapter = _make_adapter()
+    event = _make_event()
+
+    await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+    adapter._bot.set_message_reaction.assert_awaited_once_with(
+        chat_id=123,
+        message_id=456,
+        reaction=[ReactionTypeEmoji("\U0001f44e")],
+    )
+
+
+@pytest.mark.asyncio
+async def test_on_processing_complete_skipped_when_disabled(monkeypatch):
+    """Processing complete should not react when reactions are disabled."""
+    monkeypatch.delenv("TELEGRAM_REACTIONS", raising=False)
+    adapter = _make_adapter()
+    event = _make_event()
+
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    adapter._bot.set_message_reaction.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -152,5 +225,3 @@ def test_config_bridges_telegram_reactions(monkeypatch, tmp_path):
 
     import os
     assert os.getenv("TELEGRAM_REACTIONS") == "true"
-
-
