@@ -127,6 +127,40 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_session_chat_stream_can_fail_closed_without_tools(adapter, session_db):
+    session_id = session_db.create_session("voice-fast-session", "api_server")
+    captured_kwargs = {}
+
+    async def fake_run(**kwargs):
+        captured_kwargs.update(kwargs)
+        kwargs["stream_delta_callback"]("Hi.")
+        return {"final_response": "Hi.", "session_id": session_id}, {"total_tokens": 1}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                json={"message": "hello", "disable_tools": True},
+            )
+            assert resp.status == 200, await resp.text()
+
+    assert captured_kwargs["disable_tools"] is True
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_rejects_non_boolean_disable_tools(adapter, session_db):
+    session_id = session_db.create_session("voice-fast-invalid", "api_server")
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            f"/api/sessions/{session_id}/chat/stream",
+            json={"message": "hello", "disable_tools": "yes"},
+        )
+        assert resp.status == 400
+
+
+@pytest.mark.asyncio
 async def test_session_chat_stream_run_completed_carries_turn_transcript(adapter, session_db):
     """run.completed must include the full interleaved turn transcript so a
     client that lost intermediate (pre-tool-call) assistant text from the live
@@ -606,5 +640,4 @@ async def test_require_model_lock_hard_fails_when_global_default_would_be_used(a
             body = await resp.json()
             assert body["error"]["code"] in {"model_lock_unavailable", "invalid_model_lock", "missing_model"}
     mock_run.assert_not_called()
-
 

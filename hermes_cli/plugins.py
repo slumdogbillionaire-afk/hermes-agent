@@ -171,6 +171,10 @@ VALID_HOOKS: Set[str] = {
     #   {"action": "allow"}  /  None             -> normal dispatch
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
+    # Gateway lifecycle edge for plugins that own durable background delivery.
+    # Fired after adapters are connected; callbacks are synchronous and may
+    # retain asyncio tasks on the running loop. Kwarg: gateway: GatewayRunner.
+    "gateway_startup",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs an approval decision -- fires for CLI-interactive prompts,
     # gateway/ACP approvals, and smart-mode auxiliary-LLM decisions.
@@ -1065,7 +1069,7 @@ class PluginContext:
         self,
         callback_prefix: str,
         callback: Callable,
-    ) -> None:
+    ) -> bool:
         """Register a Telegram inline-keyboard callback handler.
 
         The Telegram adapter invokes the async callback for authorized users
@@ -1136,6 +1140,7 @@ class PluginContext:
             self.manifest.name,
             callback_prefix,
         )
+        return True
 
     # -- hook registration --------------------------------------------------
 
