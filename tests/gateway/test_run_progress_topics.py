@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib
+import json
 import sys
 import time
 import types
@@ -115,6 +116,26 @@ class MetadataEditProgressCaptureAdapter(ProgressCaptureAdapter):
         return SendResult(success=True, message_id=message_id)
 
 
+class FirstEditFailsProgressAdapter(MetadataEditProgressCaptureAdapter):
+    def __init__(self):
+        super().__init__()
+        self._next_id = 0
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        self._next_id += 1
+        message_id = f"progress-{self._next_id}"
+        self.sent.append({"chat_id": chat_id, "content": content, "reply_to": reply_to,
+                          "metadata": metadata, "message_id": message_id})
+        return SendResult(success=True, message_id=message_id)
+
+    async def edit_message(self, chat_id, message_id, content, *, finalize=False, metadata=None):
+        self.edits.append({"chat_id": chat_id, "message_id": message_id,
+                           "content": content, "metadata": metadata})
+        if len(self.edits) == 1:
+            return SendResult(success=False, error="message not found")
+        return SendResult(success=True, message_id=message_id)
+
+
 class NonEditingProgressCaptureAdapter(ProgressCaptureAdapter):
     SUPPORTS_MESSAGE_EDITING = False
 
@@ -203,6 +224,73 @@ class DelayedProgressAgent:
         }
 
 
+class TodoMilestoneAgent:
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        dishonest_args = {"todos": [{"content": "Fake", "status": "completed"}]}
+        first = {"todos": [
+            {"content": "Inspect", "status": "completed"},
+            {"content": "Implement safely", "status": "in_progress"},
+            {"content": "Verify", "status": "pending"},
+            {"content": "Obsolete", "status": "cancelled"},
+        ]}
+        second = {"todos": [
+            {"content": "Inspect", "status": "completed"},
+            {"content": "Implement safely", "status": "completed"},
+            {"content": "Verify", "status": "in_progress"},
+            {"content": "Obsolete", "status": "cancelled"},
+        ]}
+        cb("tool.started", "todo", "update task list", dishonest_args)
+        cb("tool.completed", "todo", None, dishonest_args, is_error=False, result=json.dumps(first))
+        time.sleep(0.35)
+        cb("tool.started", "terminal", "pytest -q", {"command": "pytest -q"})
+        cb("tool.completed", "todo", None, dishonest_args, is_error=False, result=second)
+        time.sleep(0.35)
+        return {"final_response": "separate final", "messages": [], "api_calls": 1}
+
+
+class FailedTodoAgent:
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        cb("tool.started", "terminal", "ordinary breadcrumb", {})
+        cb("tool.completed", "todo", None,
+           {"todos": [{"content": "Dishonest args", "status": "completed"}]},
+           is_error=True,
+           result={"todos": [{"content": "Failed result", "status": "completed"}]})
+        time.sleep(0.35)
+        return {"final_response": "final survives", "messages": [], "api_calls": 1}
+
+
+class EditFallbackTodoAgent:
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        cb("tool.started", "terminal", "first", {})
+        time.sleep(1.7)
+        cb("tool.completed", "todo", None, {}, is_error=False, result={"todos": [
+            {"content": "one", "status": "completed"},
+            {"content": "two", "status": "in_progress"},
+        ]})
+        time.sleep(1.7)
+        cb("tool.completed", "todo", None, {}, is_error=False, result={"todos": [
+            {"content": "one", "status": "completed"},
+            {"content": "two", "status": "completed"},
+        ]})
+        time.sleep(1.7)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
 class ManyProgressLinesAgent:
     """Emits enough tool-progress lines to exceed a single platform bubble."""
 
@@ -268,6 +356,142 @@ def _make_runner(adapter):
         stt_enabled=False,
     )
     return runner
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [None, "not json", {}, {"error": "failed"}, {"todos": []}, {"todos": ["bad"]},
+     {"todos": [{"content": "bad", "status": "unknown"}]}],
+)
+def test_todo_milestone_renderer_fails_soft(malformed):
+    gateway_run = importlib.import_module("gateway.run")
+    assert gateway_run._render_todo_milestone(malformed) is None
+
+
+def test_todo_milestone_renderer_is_honest_for_mixed_statuses():
+    gateway_run = importlib.import_module("gateway.run")
+    rendered = gateway_run._render_todo_milestone({"todos": [
+        {"id": "private-1", "content": "Done", "status": "completed"},
+        {"id": "private-2", "content": " Implement\n  safely ", "status": "in_progress"},
+        {"id": "private-3", "content": "Later", "status": "pending"},
+        {"id": "private-4", "content": "Obsolete", "status": "cancelled"},
+    ]})
+    assert rendered == (
+        "Task progress\n"
+        "\u2588\u2588\u2591\u2591\u2591\u2591\u2591\u2591\u2591\u2591 1/4 \u00b7 25%\n"
+        "Implement safely\n"
+        "1 complete · 1 cancelled · 1 waiting"
+    )
+    assert "private-" not in rendered
+
+
+def test_todo_milestone_renderer_accepts_json_and_live_objects_without_fake_100():
+    gateway_run = importlib.import_module("gateway.run")
+    live = gateway_run._render_todo_milestone({"todos": [
+        SimpleNamespace(content="Done", status="completed"),
+        SimpleNamespace(content="Cancelled", status="cancelled"),
+    ]})
+    serialized = gateway_run._render_todo_milestone(json.dumps({"todos": [
+        {"content": "Done", "status": "completed"},
+        {"content": "Cancelled", "status": "cancelled"},
+    ]}))
+    assert live == serialized
+    assert "\u2588\u2588\u2588\u2588\u2588\u2591\u2591\u2591\u2591\u2591 1/2 \u00b7 50%" in live
+    assert "100%" not in live
+    assert "1 cancelled" in live
+
+
+def test_todo_milestone_renderer_reports_multiple_active_and_bounds_content():
+    gateway_run = importlib.import_module("gateway.run")
+    rendered = gateway_run._render_todo_milestone({"todos": [
+        {"content": "first " + "x" * 1000, "status": "in_progress"},
+        {"content": "second", "status": "in_progress"},
+        {"content": "later", "status": "pending"},
+    ]})
+    assert "+1 active" in rendered
+    assert len(rendered) <= 320
+    assert "\u2026" in rendered
+
+
+@pytest.mark.asyncio
+async def test_todo_snapshots_replace_in_place_and_keep_breadcrumbs(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = TodoMilestoneAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    adapter = MetadataEditProgressCaptureAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001",
+                           chat_type="group", thread_id="17585")
+    result = await runner._run_agent(message="ship", context_prompt="", history=[], source=source,
+                                     session_id="sess-todo", session_key="topic-run-one")
+    assert result["final_response"] == "separate final"
+    assert adapter.sent and adapter.edits
+    final_progress = adapter.edits[-1]["content"]
+    assert "\u2588\u2588\u2588\u2588\u2588\u2591\u2591\u2591\u2591\u2591 2/4 \u00b7 50%" in final_progress
+    assert "Verify" in final_progress
+    assert "1/4 \u00b7 25%" not in final_progress
+    assert "Fake" not in final_progress
+    assert "pytest -q" in final_progress
+    assert adapter.edits[-1]["message_id"] == "progress-1"
+    assert adapter.edits[-1]["metadata"] == {"thread_id": "17585"}
+
+
+@pytest.mark.asyncio
+async def test_failed_todo_does_not_replace_progress_or_suppress_final(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FailedTodoAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    adapter = MetadataEditProgressCaptureAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001",
+                           chat_type="group", thread_id="one")
+    result = await runner._run_agent(message="ship", context_prompt="", history=[], source=source,
+                                     session_id="failed-todo", session_key="failed-todo")
+    assert result["final_response"] == "final survives"
+    outgoing = "\n".join(call["content"] for call in adapter.sent + adapter.edits)
+    assert "ordinary breadcrumb" in outgoing
+    assert "Task progress" not in outgoing
+    assert "Dishonest args" not in outgoing
+    assert "Failed result" not in outgoing
+
+
+@pytest.mark.asyncio
+async def test_edit_failure_fallback_adopts_new_message_id(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = EditFallbackTodoAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    adapter = FirstEditFailsProgressAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001",
+                           chat_type="group", thread_id="fallback")
+    result = await runner._run_agent(message="ship", context_prompt="", history=[], source=source,
+                                     session_id="fallback", session_key="fallback")
+    assert result["final_response"] == "done"
+    assert [call["message_id"] for call in adapter.sent] == ["progress-1", "progress-2"]
+    assert adapter.edits[0]["message_id"] == "progress-1"
+    assert adapter.edits[-1]["message_id"] == "progress-2"
+    assert "2/2 \u00b7 100%" in adapter.edits[-1]["content"]
 
 
 @pytest.mark.asyncio

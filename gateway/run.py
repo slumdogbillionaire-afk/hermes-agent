@@ -71,6 +71,76 @@ _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
+
+@dataclasses.dataclass(frozen=True)
+class _ProgressReplacement:
+    """A keyed progress section that replaces its prior snapshot."""
+
+    key: str
+    text: str
+
+
+def _todo_field(value: Any, field: str) -> Any:
+    if isinstance(value, dict):
+        return value.get(field)
+    return getattr(value, field, None)
+
+
+def _render_todo_milestone(result: Any) -> Optional[str]:
+    """Render a successful canonical todo snapshot, or fail soft with ``None``."""
+    try:
+        payload = json.loads(result) if isinstance(result, str) else result
+        if isinstance(payload, dict):
+            if payload.get("error"):
+                return None
+            todos = payload.get("todos")
+        else:
+            if getattr(payload, "error", None):
+                return None
+            todos = getattr(payload, "todos", None)
+        if not isinstance(todos, (list, tuple)) or not todos:
+            return None
+
+        valid_statuses = {"pending", "in_progress", "completed", "cancelled"}
+        normalized = []
+        for item in todos:
+            status = _todo_field(item, "status")
+            content = _todo_field(item, "content")
+            if status not in valid_statuses or not isinstance(content, str):
+                return None
+            content = " ".join(content.split())
+            if not content:
+                return None
+            normalized.append((status, content))
+
+        total = len(normalized)
+        completed = sum(status == "completed" for status, _ in normalized)
+        cancelled = sum(status == "cancelled" for status, _ in normalized)
+        pending = sum(status == "pending" for status, _ in normalized)
+        active = [content for status, content in normalized if status == "in_progress"]
+        percent = completed * 100 // total
+        filled = completed * 10 // total
+        bar = "\u2588" * filled + "\u2591" * (10 - filled)
+
+        lines = ["Task progress", f"{bar} {completed}/{total} \u00b7 {percent}%"]
+        if active:
+            suffix = f" (+{len(active) - 1} active)" if len(active) > 1 else ""
+            stage_limit = 180 - len(suffix)
+            stage = active[0]
+            if len(stage) > stage_limit:
+                stage = stage[: stage_limit - 1].rstrip() + "\u2026"
+            lines.append(stage + suffix)
+
+        counts = [f"{completed} complete"]
+        if cancelled:
+            counts.append(f"{cancelled} cancelled")
+        if pending:
+            counts.append(f"{pending} waiting")
+        lines.append(" \u00b7 ".join(counts))
+        return "\n".join(lines)
+    except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
     r"auxiliary\s+.+\s+failed"
@@ -7257,6 +7327,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         await self.hooks.emit("gateway:startup", {
             "platforms": [p.value for p in self.adapters.keys()],
         })
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_plugin_hook
+
+            _invoke_plugin_hook("gateway_startup", gateway=self)
+        except Exception as _plugin_startup_exc:
+            logger.warning("gateway_startup plugin invocation failed: %s", _plugin_startup_exc)
         
         if connected_count > 0:
             logger.info("Gateway running with %s platform(s)", connected_count)
@@ -17258,6 +17334,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not progress_queue or not _run_still_current():
                 return
 
+            # Successful todo results are authoritative full-state snapshots;
+            # request arguments may be stale or rejected and are never truth.
+            if (
+                tool_progress_enabled
+                and event_type == "tool.completed"
+                and tool_name == "todo"
+                and not kwargs.get("is_error")
+            ):
+                milestone = _render_todo_milestone(kwargs.get("result"))
+                if milestone is not None:
+                    progress_queue.put(_ProgressReplacement("todo-milestone", milestone))
+
             # First-touch onboarding: the first time a tool takes longer than
             # _LONG_TOOL_THRESHOLD_S during a run that's streaming every tool
             # (progress_mode == "all"), append a one-time hint suggesting
@@ -17607,7 +17695,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return await adapter.edit_message(**kwargs)
 
             def _progress_text(lines: list) -> str:
-                return "\n".join(str(line) for line in lines)
+                return "\n".join(
+                    line.text if isinstance(line, _ProgressReplacement) else str(line)
+                    for line in lines
+                )
+
+            def _apply_replacement(event: _ProgressReplacement) -> None:
+                progress_lines[:] = [
+                    line for line in progress_lines
+                    if not isinstance(line, _ProgressReplacement) or line.key != event.key
+                ]
+                progress_lines.append(event)
 
             def _split_progress_groups(lines: list) -> list[list]:
                 """Partition progress lines into platform-sized editable bubbles."""
@@ -17712,6 +17810,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if progress_lines:
                             progress_lines[-1] = f"{base_msg} (×{count + 1})"
                         msg = progress_lines[-1] if progress_lines else base_msg
+                    elif isinstance(raw, _ProgressReplacement):
+                        _apply_replacement(raw)
+                        msg = raw.text
                     elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
                         # Content bubble just landed on the platform — close off
                         # the current tool-progress bubble so the next tool
@@ -17755,7 +17856,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                     if can_edit and progress_msg_id is not None:
                         # Try to edit the existing progress message
-                        full_text = "\n".join(progress_lines)
+                        full_text = _progress_text(progress_lines)
                         result = await _edit_progress_message(progress_msg_id, full_text)
                         if not result.success:
                             _err = (getattr(result, "error", "") or "").lower()
@@ -17778,24 +17879,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     adapter.name,
                                 )
                                 _last_edit_ts = time.monotonic()
-                            else:
-                                can_edit = False
-                            _flood_result = await adapter.send(
-                                chat_id=source.chat_id,
-                                content=msg,
-                                reply_to=_progress_reply_to,
-                                metadata=_progress_metadata,
-                            )
-                            if (
-                                _cleanup_progress
-                                and getattr(_flood_result, "success", False)
-                                and getattr(_flood_result, "message_id", None)
-                            ):
-                                _cleanup_msg_ids.append(str(_flood_result.message_id))
+                            _fallback_result = await _send_progress_text(full_text)
+                            if _fallback_result.success and _fallback_result.message_id:
+                                # Adopt the replacement bubble so later updates
+                                # edit it rather than repeatedly fanning out.
+                                progress_msg_id = _fallback_result.message_id
+                                can_edit = True
                     else:
                         if can_edit:
                             # First tool: send all accumulated text as new message
-                            full_text = "\n".join(progress_lines)
+                            full_text = _progress_text(progress_lines)
                             result = await adapter.send(
                                 chat_id=source.chat_id,
                                 content=full_text,
@@ -17834,6 +17927,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 if progress_lines:
                                     progress_lines[-1] = f"{base_msg} (×{count + 1})"
                                     await _roll_progress_overflow_if_needed()
+                            elif isinstance(raw, _ProgressReplacement):
+                                _apply_replacement(raw)
+                                await _roll_progress_overflow_if_needed()
                             elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
                                 # Content-bubble marker during drain: close off
                                 # the current progress bubble and start a fresh

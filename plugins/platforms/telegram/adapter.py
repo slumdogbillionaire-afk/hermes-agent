@@ -5464,6 +5464,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 return
             if result:
                 return
+            # Plugin callback prefixes cannot overlap built-in namespaces, so
+            # a matching prefix is owned by this plugin even when its callback
+            # declines the specific payload. Consume it here instead of
+            # falling through to the final no-op return, which leaves
+            # Telegram's button highlighted indefinitely.
+            await query.answer(text="This action is unavailable or expired.")
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):
