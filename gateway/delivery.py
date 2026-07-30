@@ -516,12 +516,17 @@ class DeliveryRouter:
                 # createForumTopic and can use message_thread_id directly.
                 reply_anchor = send_metadata.get("telegram_reply_to_message_id")
                 if reply_anchor is None:
-                    raise RuntimeError(
-                        "Telegram private DM topic delivery requires telegram_reply_to_message_id; "
-                        "send to the bare chat or provide a reply anchor"
-                    )
-                send_metadata["thread_id"] = target_thread_id
-                send_metadata["telegram_dm_topic_reply_fallback"] = True
+                    # THREAD-ID-FIX 2026-07-24: a bare-integer thread with no
+                    # reply anchor is not a real reply target. Route it as a
+                    # plain message_thread_id send (which HAS the adapter's root
+                    # fallback when the private DM topic is gone) instead of the
+                    # anchor-required dm_topic_reply_fallback path below, which
+                    # fails closed with NO root fallback and silently loses the
+                    # message once the stale topic no longer exists.
+                    send_metadata["thread_id"] = target_thread_id
+                else:
+                    send_metadata["thread_id"] = target_thread_id
+                    send_metadata["telegram_dm_topic_reply_fallback"] = True
             elif "thread_id" not in send_metadata and "message_thread_id" not in send_metadata and not has_explicit_direct_topic:
                 send_metadata["thread_id"] = target_thread_id
         result = await adapter.send(target.chat_id, content, metadata=send_metadata or None)
