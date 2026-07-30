@@ -11,7 +11,7 @@
     "tests-js"
   ],
   "scripts": {
-    "postinstall": "echo '✅ Browser tools ready. Run: python run_agent.py --help'",
+    "postinstall": "echo '\u2705 Browser tools ready. Run: python run_agent.py --help'",
     "install:root": "npm install --workspaces=false",
     "install:web": "npm install --workspace web",
     "install:tui": "npm install --workspace ui-tui",
@@ -53,6 +53,8 @@
     "node-pty@1.1.0": true,
     "electron-winstaller@5.4.0": true,
     "agent-browser@0.26.0": true,
-    "electron@40.10.2": true
+    "electron@40.10.2": true,
+    "fsevents@2.3.2": true,
+    "fsevents@2.3.3": true
   }
 }
