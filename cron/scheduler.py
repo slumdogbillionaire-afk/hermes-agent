@@ -1930,6 +1930,40 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 )
                                 logger.warning("Job '%s': %s", job["id"], msg)
                                 delivery_errors.append(msg)
+                                # THREAD-ID-FIX 2026-07-24: the adapter had to
+                                # drop a stale private DM-topic id to deliver to
+                                # root. Durably clear the dead id from the
+                                # persisted job so future fires don't re-attempt
+                                # the gone topic (which can hard-fail with no root
+                                # fallback and lose the message). A continuable
+                                # job re-opens a fresh thread on the next fire via
+                                # _open_continuable_cron_thread; a non-continuable
+                                # one simply stays root-delivered. Delivery already
+                                # succeeded here, so a persistence error only logs.
+                                try:
+                                    persisted_origin = job.get("origin")
+                                    if (
+                                        isinstance(persisted_origin, dict)
+                                        and persisted_origin.get("thread_id") is not None
+                                    ):
+                                        from cron.jobs import update_job
+                                        cleared_origin = {
+                                            **persisted_origin,
+                                            "thread_id": None,
+                                        }
+                                        update_job(job["id"], {"origin": cleared_origin})
+                                        logger.info(
+                                            "Job '%s': cleared stale origin "
+                                            "thread_id %s after thread_fallback",
+                                            job["id"],
+                                            persisted_origin.get("thread_id"),
+                                        )
+                                except Exception as clear_exc:
+                                    logger.warning(
+                                        "Job '%s': failed to clear stale origin "
+                                        "thread_id after thread_fallback: %s",
+                                        job["id"], clear_exc,
+                                    )
 
                 # Send extracted media files as native attachments via the live
                 # adapter, using the same DM-topic-aware routing as the text send
