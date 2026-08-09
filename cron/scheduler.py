@@ -48,6 +48,7 @@ from hermes_cli.config import (
 )
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
+from agent.interrupt_compat import request_hard_interrupt
 
 logger = logging.getLogger(__name__)
 
@@ -281,7 +282,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim
+from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_runs, claim_dispatch, heartbeat_run_claim
 from cron.executions import create_execution, finish_execution, mark_execution_running
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
@@ -818,9 +819,19 @@ def _seed_cron_thread_session(
             except (ValueError, KeyError):
                 platform_enum = None
             if platform_enum is not None:
+                # Discord thread destinations must key on the thread's OWN id
+                # to match how the Discord adapter keys organic in-thread
+                # messages (chat_id == thread_id). Other platforms (Slack,
+                # Telegram) use chat_id == parent_channel for thread messages,
+                # so the parent chat_id is correct for them. See the matching
+                # guard in GatewayRunner._process_handoff.
+                if platform_enum == Platform.DISCORD:
+                    seed_chat_id = str(thread_id)
+                else:
+                    seed_chat_id = str(chat_id)
                 dest_source = SessionSource(
                     platform=platform_enum,
-                    chat_id=str(chat_id),
+                    chat_id=seed_chat_id,
                     chat_name=chat_name,
                     chat_type="thread",
                     user_id="system:cron",
@@ -1919,6 +1930,40 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 )
                                 logger.warning("Job '%s': %s", job["id"], msg)
                                 delivery_errors.append(msg)
+                                # THREAD-ID-FIX 2026-07-24: the adapter had to
+                                # drop a stale private DM-topic id to deliver to
+                                # root. Durably clear the dead id from the
+                                # persisted job so future fires don't re-attempt
+                                # the gone topic (which can hard-fail with no root
+                                # fallback and lose the message). A continuable
+                                # job re-opens a fresh thread on the next fire via
+                                # _open_continuable_cron_thread; a non-continuable
+                                # one simply stays root-delivered. Delivery already
+                                # succeeded here, so a persistence error only logs.
+                                try:
+                                    persisted_origin = job.get("origin")
+                                    if (
+                                        isinstance(persisted_origin, dict)
+                                        and persisted_origin.get("thread_id") is not None
+                                    ):
+                                        from cron.jobs import update_job
+                                        cleared_origin = {
+                                            **persisted_origin,
+                                            "thread_id": None,
+                                        }
+                                        update_job(job["id"], {"origin": cleared_origin})
+                                        logger.info(
+                                            "Job '%s': cleared stale origin "
+                                            "thread_id %s after thread_fallback",
+                                            job["id"],
+                                            persisted_origin.get("thread_id"),
+                                        )
+                                except Exception as clear_exc:
+                                    logger.warning(
+                                        "Job '%s': failed to clear stale origin "
+                                        "thread_id after thread_fallback: %s",
+                                        job["id"], clear_exc,
+                                    )
 
                 # Send extracted media files as native attachments via the live
                 # adapter, using the same DM-topic-aware routing as the text send
@@ -3008,11 +3053,6 @@ def run_job(
 
     agent = None
 
-    # Mark this as a cron session so the approval system can apply cron_mode.
-    # This env var is process-wide and persists for the lifetime of the
-    # scheduler process — every job this process runs is a cron job.
-    os.environ["HERMES_CRON_SESSION"] = "1"
-
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).
     from gateway.session_context import set_session_vars, clear_session_vars, _VAR_MAP
@@ -3115,7 +3155,14 @@ def run_job(
     # statement raises.  A leaked writer would deadlock the whole scheduler
     # (every future job blocks on acquire_*); a leaked reader blocks all
     # future writers.  Acquire itself can't leak (it either blocks or returns).
+    _cron_session_var = _VAR_MAP["HERMES_CRON_SESSION"]
+    _cron_session_token = None
     try:
+        # Scope cron approval policy to this job. Keep the token so the finally
+        # restores the pre-job state instead of pinning an explicit empty value,
+        # which would suppress the legacy os.environ fallback used by standalone
+        # cron entrypoints and tests.
+        _cron_session_token = _cron_session_var.set("1")
         if _job_workdir:
             os.environ["TERMINAL_CWD"] = _job_workdir
             logger.info("Job '%s': using workdir %s", job_id, _job_workdir)
@@ -3632,8 +3679,7 @@ def run_job(
                 _last_desc, _iter_n, _iter_max,
                 _cur_tool or "none",
             )
-            if hasattr(agent, "interrupt"):
-                agent.interrupt("Cron job timed out (inactivity)")
+            request_hard_interrupt(agent, "Cron job timed out (inactivity)")
             raise TimeoutError(
                 f"Cron job '{job_name}' idle for "
                 f"{int(_secs_ago)}s (limit {int(_cron_inactivity_limit)}s) "
@@ -3763,6 +3809,8 @@ def run_job(
         # clear_session_vars also clears _SESSION_CWD internally, so no
         # separate clear_session_cwd() call is needed.
         clear_session_vars(_ctx_tokens)
+        if _cron_session_token is not None:
+            _cron_session_var.reset(_cron_session_token)
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
         if _session_db:
@@ -4144,8 +4192,20 @@ def tick(
 
         due_jobs = get_due_jobs()
 
-        if verbose and not due_jobs:
-            logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
+        if not due_jobs:
+            # Idle tick: skip config load + pool partitioning entirely
+            # (#33612 — the gateway ticker calls tick(verbose=False) every
+            # 60s, so idle ticks previously fell through to load_config()).
+            # Still run the post-tick MCP orphan sweep: main intentionally
+            # sweeps on idle ticks so orphaned stdio children from crashed
+            # jobs are reaped even when nothing is due.
+            if verbose:
+                logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
+            try:
+                from tools.mcp_tool import _kill_orphaned_mcp_children
+                _kill_orphaned_mcp_children()
+            except Exception as _e:
+                logger.debug("Post-tick MCP orphan cleanup failed: %s", _e)
             return 0
 
         if verbose:
@@ -4153,11 +4213,11 @@ def tick(
 
         # Advance next_run_at for all recurring jobs FIRST, under the file lock,
         # before any execution begins.  This preserves at-most-once semantics.
-        # For parallel jobs that are already running, advance_next_run keeps
+        # For parallel jobs that are already running, the advance keeps
         # bumping next_run_at forward so the grace window never expires.
         # mark_job_run() overwrites next_run_at on completion.
-        for job in due_jobs:
-            advance_next_run(job["id"])
+        # Batched: one load + one save for the whole due set, not one per job.
+        advance_next_runs([job["id"] for job in due_jobs])
 
         # Resolve max parallel workers: env var > config.yaml > unbounded.
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.

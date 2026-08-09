@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib
+import json
 import sys
 import time
 import types
@@ -57,6 +58,18 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id: str):
         return {"id": chat_id}
+
+
+class DiscordProgressCaptureAdapter(ProgressCaptureAdapter):
+    """Capture sends while exercising Discord's real preview formatter."""
+
+    def __init__(self):
+        super().__init__(platform=Platform.DISCORD)
+
+    def format_tool_preview(self, preview, **kwargs):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        return DiscordAdapter.format_tool_preview(self, preview, **kwargs)
 
 
 class SmallLimitProgressAdapter(ProgressCaptureAdapter):
@@ -168,6 +181,26 @@ class RetryableOverflowEditProgressAdapter(SmallLimitProgressAdapter):
         return await super().edit_message(chat_id, message_id, content)
 
 
+class FirstEditFailsProgressAdapter(MetadataEditProgressCaptureAdapter):
+    def __init__(self):
+        super().__init__()
+        self._next_id = 0
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        self._next_id += 1
+        message_id = f"progress-{self._next_id}"
+        self.sent.append({"chat_id": chat_id, "content": content, "reply_to": reply_to,
+                          "metadata": metadata, "message_id": message_id})
+        return SendResult(success=True, message_id=message_id)
+
+    async def edit_message(self, chat_id, message_id, content, *, finalize=False, metadata=None):
+        self.edits.append({"chat_id": chat_id, "message_id": message_id,
+                           "content": content, "metadata": metadata})
+        if len(self.edits) == 1:
+            return SendResult(success=False, error="message not found")
+        return SendResult(success=True, message_id=message_id)
+
+
 class NonEditingProgressCaptureAdapter(ProgressCaptureAdapter):
     SUPPORTS_MESSAGE_EDITING = False
 
@@ -239,6 +272,28 @@ class LongPreviewAgent:
         }
 
 
+class UrlPreviewAgent:
+    URL = "https://hermes-agent.nousresearch.com/docs/gateway/discord/tool-progress"
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        self.tool_progress_callback(
+            "tool.started",
+            "web_extract",
+            self.URL,
+            {"urls": [self.URL]},
+        )
+        time.sleep(0.35)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class DelayedProgressAgent:
     def __init__(self, **kwargs):
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
@@ -279,6 +334,73 @@ class RetryableEditProgressAgent:
             "messages": [],
             "api_calls": 1,
         }
+
+
+class TodoMilestoneAgent:
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        dishonest_args = {"todos": [{"content": "Fake", "status": "completed"}]}
+        first = {"todos": [
+            {"content": "Inspect", "status": "completed"},
+            {"content": "Implement safely", "status": "in_progress"},
+            {"content": "Verify", "status": "pending"},
+            {"content": "Obsolete", "status": "cancelled"},
+        ]}
+        second = {"todos": [
+            {"content": "Inspect", "status": "completed"},
+            {"content": "Implement safely", "status": "completed"},
+            {"content": "Verify", "status": "in_progress"},
+            {"content": "Obsolete", "status": "cancelled"},
+        ]}
+        cb("tool.started", "todo", "update task list", dishonest_args)
+        cb("tool.completed", "todo", None, dishonest_args, is_error=False, result=json.dumps(first))
+        time.sleep(0.35)
+        cb("tool.started", "terminal", "pytest -q", {"command": "pytest -q"})
+        cb("tool.completed", "todo", None, dishonest_args, is_error=False, result=second)
+        time.sleep(0.35)
+        return {"final_response": "separate final", "messages": [], "api_calls": 1}
+
+
+class FailedTodoAgent:
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        cb("tool.started", "terminal", "ordinary breadcrumb", {})
+        cb("tool.completed", "todo", None,
+           {"todos": [{"content": "Dishonest args", "status": "completed"}]},
+           is_error=True,
+           result={"todos": [{"content": "Failed result", "status": "completed"}]})
+        time.sleep(0.35)
+        return {"final_response": "final survives", "messages": [], "api_calls": 1}
+
+
+class EditFallbackTodoAgent:
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        cb("tool.started", "terminal", "first", {})
+        time.sleep(1.7)
+        cb("tool.completed", "todo", None, {}, is_error=False, result={"todos": [
+            {"content": "one", "status": "completed"},
+            {"content": "two", "status": "in_progress"},
+        ]})
+        time.sleep(1.7)
+        cb("tool.completed", "todo", None, {}, is_error=False, result={"todos": [
+            {"content": "one", "status": "completed"},
+            {"content": "two", "status": "completed"},
+        ]})
+        time.sleep(1.7)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
 
 
 class ManyProgressLinesAgent:
@@ -348,6 +470,142 @@ def _make_runner(adapter):
     return runner
 
 
+@pytest.mark.parametrize(
+    "malformed",
+    [None, "not json", {}, {"error": "failed"}, {"todos": []}, {"todos": ["bad"]},
+     {"todos": [{"content": "bad", "status": "unknown"}]}],
+)
+def test_todo_milestone_renderer_fails_soft(malformed):
+    gateway_run = importlib.import_module("gateway.run")
+    assert gateway_run._render_todo_milestone(malformed) is None
+
+
+def test_todo_milestone_renderer_is_honest_for_mixed_statuses():
+    gateway_run = importlib.import_module("gateway.run")
+    rendered = gateway_run._render_todo_milestone({"todos": [
+        {"id": "private-1", "content": "Done", "status": "completed"},
+        {"id": "private-2", "content": " Implement\n  safely ", "status": "in_progress"},
+        {"id": "private-3", "content": "Later", "status": "pending"},
+        {"id": "private-4", "content": "Obsolete", "status": "cancelled"},
+    ]})
+    assert rendered == (
+        "Task progress\n"
+        "\u2588\u2588\u2591\u2591\u2591\u2591\u2591\u2591\u2591\u2591 1/4 \u00b7 25%\n"
+        "Implement safely\n"
+        "1 complete · 1 cancelled · 1 waiting"
+    )
+    assert "private-" not in rendered
+
+
+def test_todo_milestone_renderer_accepts_json_and_live_objects_without_fake_100():
+    gateway_run = importlib.import_module("gateway.run")
+    live = gateway_run._render_todo_milestone({"todos": [
+        SimpleNamespace(content="Done", status="completed"),
+        SimpleNamespace(content="Cancelled", status="cancelled"),
+    ]})
+    serialized = gateway_run._render_todo_milestone(json.dumps({"todos": [
+        {"content": "Done", "status": "completed"},
+        {"content": "Cancelled", "status": "cancelled"},
+    ]}))
+    assert live == serialized
+    assert "\u2588\u2588\u2588\u2588\u2588\u2591\u2591\u2591\u2591\u2591 1/2 \u00b7 50%" in live
+    assert "100%" not in live
+    assert "1 cancelled" in live
+
+
+def test_todo_milestone_renderer_reports_multiple_active_and_bounds_content():
+    gateway_run = importlib.import_module("gateway.run")
+    rendered = gateway_run._render_todo_milestone({"todos": [
+        {"content": "first " + "x" * 1000, "status": "in_progress"},
+        {"content": "second", "status": "in_progress"},
+        {"content": "later", "status": "pending"},
+    ]})
+    assert "+1 active" in rendered
+    assert len(rendered) <= 320
+    assert "\u2026" in rendered
+
+
+@pytest.mark.asyncio
+async def test_todo_snapshots_replace_in_place_and_keep_breadcrumbs(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = TodoMilestoneAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    adapter = MetadataEditProgressCaptureAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001",
+                           chat_type="group", thread_id="17585")
+    result = await runner._run_agent(message="ship", context_prompt="", history=[], source=source,
+                                     session_id="sess-todo", session_key="topic-run-one")
+    assert result["final_response"] == "separate final"
+    assert adapter.sent and adapter.edits
+    final_progress = adapter.edits[-1]["content"]
+    assert "\u2588\u2588\u2588\u2588\u2588\u2591\u2591\u2591\u2591\u2591 2/4 \u00b7 50%" in final_progress
+    assert "Verify" in final_progress
+    assert "1/4 \u00b7 25%" not in final_progress
+    assert "Fake" not in final_progress
+    assert "pytest -q" in final_progress
+    assert adapter.edits[-1]["message_id"] == "progress-1"
+    assert adapter.edits[-1]["metadata"] == {"thread_id": "17585"}
+
+
+@pytest.mark.asyncio
+async def test_failed_todo_does_not_replace_progress_or_suppress_final(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FailedTodoAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    adapter = MetadataEditProgressCaptureAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001",
+                           chat_type="group", thread_id="one")
+    result = await runner._run_agent(message="ship", context_prompt="", history=[], source=source,
+                                     session_id="failed-todo", session_key="failed-todo")
+    assert result["final_response"] == "final survives"
+    outgoing = "\n".join(call["content"] for call in adapter.sent + adapter.edits)
+    assert "ordinary breadcrumb" in outgoing
+    assert "Task progress" not in outgoing
+    assert "Dishonest args" not in outgoing
+    assert "Failed result" not in outgoing
+
+
+@pytest.mark.asyncio
+async def test_edit_failure_fallback_adopts_new_message_id(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = EditFallbackTodoAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    adapter = FirstEditFailsProgressAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001",
+                           chat_type="group", thread_id="fallback")
+    result = await runner._run_agent(message="ship", context_prompt="", history=[], source=source,
+                                     session_id="fallback", session_key="fallback")
+    assert result["final_response"] == "done"
+    assert [call["message_id"] for call in adapter.sent] == ["progress-1", "progress-2"]
+    assert adapter.edits[0]["message_id"] == "progress-1"
+    assert adapter.edits[-1]["message_id"] == "progress-2"
+    assert "2/2 \u00b7 100%" in adapter.edits[-1]["content"]
+
+
 @pytest.mark.asyncio
 async def test_run_agent_progress_uses_event_message_id_for_slack_dm(monkeypatch, tmp_path):
     """Slack DM progress should keep event ts fallback threading."""
@@ -400,6 +658,123 @@ async def test_run_agent_progress_uses_event_message_id_for_slack_dm(monkeypatch
     }
     assert adapter.sent[0]["metadata"] == expected_metadata
     assert all(call["metadata"] == expected_metadata for call in adapter.typing)
+
+
+@pytest.mark.asyncio
+async def test_progress_carries_anchor_for_relay_discord_auto_thread(monkeypatch, tmp_path):
+    """Relay Discord channel-initiate: the thread doesn't exist at ingest, so
+    the connector auto-threads on the reply anchor and stamps
+    prospective_thread_id. The tool-progress / status bubbles must carry that
+    anchor (reply_to + metadata.reply_to_message_id) so they route into the
+    SAME auto-thread as the final reply — otherwise the search-status updates
+    leak into the parent channel (staging repro 2026-08-02)."""
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+    import yaml
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump({"display": {"platforms": {"discord": {"tool_progress": "all"}}}}),
+        encoding="utf-8",
+    )
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FakeAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = ProgressCaptureAdapter(platform=Platform.RELAY)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    # Channel-initiating message: no thread_id yet, but the connector stamped
+    # the prospective thread id (== the triggering message id). Relay ingress
+    # keeps the underlying platform (discord) on the source for display policy,
+    # but delivery/progress route through the one live RelayAdapter.
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="chan-parent",
+        chat_type="group",
+        thread_id=None,
+        prospective_thread_id="msg-anchor-1",
+        delivered_via_upstream_relay=True,
+    )
+
+    result = await runner._run_agent(
+        message="find me a gift",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-relay-thread",
+        session_key="agent:main:discord:thread:chan-parent:msg-anchor-1",
+        event_message_id="msg-anchor-1",
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent, "expected at least one progress send"
+    # Every progress send must carry the anchor so the connector threads it.
+    for call in adapter.sent:
+        assert call["reply_to"] == "msg-anchor-1", call
+        assert (call["metadata"] or {}).get("reply_to_message_id") == "msg-anchor-1", call
+        # Discord lifecycle/status sends are marked non-conversational.
+        assert (call["metadata"] or {}).get("non_conversational") is True, call
+
+
+@pytest.mark.asyncio
+async def test_progress_no_anchor_for_native_discord_thread_event(monkeypatch, tmp_path):
+    """A message ARRIVING in an existing Discord thread (not the relay
+    auto-thread lane) must NOT get the synthetic prospective anchor — it already
+    routes by its real thread. Guards against over-broadening the relay fix."""
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+    import yaml
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump({"display": {"platforms": {"discord": {"tool_progress": "all"}}}}),
+        encoding="utf-8",
+    )
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FakeAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = ProgressCaptureAdapter(platform=Platform.RELAY)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    # No prospective_thread_id (event is IN a real thread already).
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="real-thread-9",
+        chat_type="thread",
+        thread_id="real-thread-9",
+        delivered_via_upstream_relay=True,
+    )
+
+    result = await runner._run_agent(
+        message="continue",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-in-thread",
+        session_key="agent:main:discord:thread:real-thread-9:real-thread-9",
+        event_message_id="msg-2",
+    )
+
+    assert result["final_response"] == "done"
+    # The relay-prospective synthetic anchor path must NOT engage; progress
+    # routes by the real thread's own metadata, not a forced reply_to anchor.
+    for call in adapter.sent:
+        meta = call["metadata"] or {}
+        # The real thread id drives routing; we did not inject the anchor
+        # reply_to that the prospective lane uses.
+        assert meta.get("thread_id") == "real-thread-9" or call["reply_to"] != "msg-2", call
 
 
 # ---------------------------------------------------------------------------
@@ -491,6 +866,59 @@ def test_all_mode_respects_custom_preview_length(monkeypatch, tmp_path):
     assert len(preview_text) > 40, f"Preview suspiciously short ({len(preview_text)}): {preview_text}"
     # But still capped at 120
     assert len(preview_text) <= 120, f"Preview too long ({len(preview_text)}): {preview_text}"
+
+
+def test_discord_truncated_tool_url_links_to_full_destination(monkeypatch, tmp_path):
+    """The real gateway path must retain the URL beyond its visible cap."""
+    import yaml
+
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = UrlPreviewAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump({"display": {"tool_preview_length": 0}}),
+        encoding="utf-8",
+    )
+
+    adapter = DiscordProgressCaptureAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"api_key": "***"},
+    )
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="12345",
+        chat_type="dm",
+        thread_id=None,
+    )
+    result = asyncio.get_event_loop().run_until_complete(
+        runner._run_agent(
+            message="hello",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="sess-discord-url",
+            session_key="agent:main:discord:dm:12345",
+        )
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent
+    visible = UrlPreviewAgent.URL[:37] + "..."
+    label = visible.removeprefix("https://")
+    assert f"[{label}](<{UrlPreviewAgent.URL}>)" in adapter.sent[0]["content"]
 
 
 class CommentaryAgent:
@@ -1316,5 +1744,3 @@ class TestSlackReplyInThreadProgressRouting:
             event_message_id="1700000000.000100",
             reply_in_thread=False,
         ) is None
-
-

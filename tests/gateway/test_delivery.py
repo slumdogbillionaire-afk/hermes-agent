@@ -226,6 +226,28 @@ class StaleTopicAdapter:
         return "38064" if force_create else "32343"
 
 
+# THREAD-ID-FIX 2026-07-24: a bare-integer private thread with no reply anchor
+# used to fail closed (RuntimeError, no root fallback -> lost message). It now
+# routes as a plain message_thread_id send, which carries the adapter's root
+# fallback when the stale DM topic is gone.
+@pytest.mark.asyncio
+async def test_explicit_telegram_private_thread_without_anchor_routes_plain(tmp_path, monkeypatch):
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    adapter = RecordingAdapter()
+    router = DeliveryRouter(GatewayConfig(), adapters={Platform.TELEGRAM: adapter})
+    target = DeliveryTarget.parse("telegram:722341991:32344")
+
+    await router._deliver_to_platform(target, "hello", metadata=None)
+
+    assert adapter.calls == [
+        {
+            "chat_id": "722341991",
+            "content": "hello",
+            "metadata": {"thread_id": "32344"},
+        }
+    ]
+
+
 @pytest.mark.asyncio
 async def test_named_telegram_private_topic_is_created_before_delivery(tmp_path, monkeypatch):
     monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
@@ -327,5 +349,4 @@ async def test_long_output_truncated_for_non_chunking_adapter(tmp_path, monkeypa
     saved_files = list(tmp_path.glob("cron/output/job1_*.txt"))
     assert len(saved_files) == 1
     assert saved_files[0].read_text() == long_content
-
 
