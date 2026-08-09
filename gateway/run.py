@@ -4394,7 +4394,7 @@ class TurnRunner:
         # Map platform enum to the platform hint key the agent understands.
         # Platform.LOCAL ("local") maps to "cli"; others pass through as-is.
         platform_key = "cli" if ctx.source.platform == Platform.LOCAL else ctx.source.platform.value
-        
+
         # Combine platform context, YAML channel_prompts hint for this chat,
         # channel_overrides system_prompt (or global ephemeral), and gateway
         # ephemeral prompt from _get_system_prompt_for_channel.
@@ -11356,7 +11356,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _invoke_plugin_hook("gateway_startup", gateway=self)
         except Exception as _plugin_startup_exc:
             logger.warning("gateway_startup plugin invocation failed: %s", _plugin_startup_exc)
-        
+
         if connected_count > 0:
             logger.info("Gateway running with %s platform(s)", connected_count)
         
