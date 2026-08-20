@@ -2927,6 +2927,85 @@ class PluginContext:
         )
         return handle
 
+    # -- Telegram callback handler registration -----------------------------
+
+    def register_telegram_callback_handler(
+        self,
+        callback_prefix: str,
+        callback: Callable,
+    ) -> bool:
+        """Register a Telegram inline-keyboard callback handler.
+
+        The Telegram adapter invokes the async callback for authorized users
+        when ``CallbackQuery.data`` starts with ``callback_prefix``. The
+        callback receives keyword arguments ``query``, ``data``, ``adapter``,
+        and ``context``. Return truthy when handled; falsey falls through to
+        Hermes' built-in callback routing.
+        """
+        if not callable(callback):
+            raise ValueError(
+                f"Plugin '{self.manifest.name}' tried to register a Telegram "
+                f"callback handler with a non-callable callback."
+            )
+        if not isinstance(callback_prefix, str) or not callback_prefix.strip():
+            raise ValueError(
+                f"Plugin '{self.manifest.name}' tried to register a Telegram "
+                f"callback handler with an empty callback prefix."
+            )
+        callback_prefix = callback_prefix.strip()
+        reserved_prefixes = (
+            "mp:",
+            "mpg:",
+            "mpv:",
+            "mm:",
+            "mc:",
+            "mb",
+            "mx",
+            "mg:",
+            "gt:",
+            "da:",
+            "ea:",
+            "sc:",
+            "cl:",
+            "update_prompt:",
+        )
+        for reserved_prefix in reserved_prefixes:
+            if (
+                callback_prefix.startswith(reserved_prefix)
+                or reserved_prefix.startswith(callback_prefix)
+            ):
+                raise ValueError(
+                    f"Plugin '{self.manifest.name}' Telegram callback prefix "
+                    f"'{callback_prefix}' overlaps reserved built-in namespace "
+                    f"'{reserved_prefix}'."
+                )
+        if len(callback_prefix.encode("utf-8")) > 64:
+            raise ValueError(
+                f"Plugin '{self.manifest.name}' tried to register a Telegram "
+                f"callback prefix larger than Telegram's 64-byte callback-data limit."
+            )
+        for existing_prefix, _existing_callback, existing_plugin in (
+            self._manager._telegram_callback_handlers
+        ):
+            if (
+                callback_prefix.startswith(existing_prefix)
+                or existing_prefix.startswith(callback_prefix)
+            ):
+                raise ValueError(
+                    f"Plugin '{self.manifest.name}' Telegram callback prefix "
+                    f"'{callback_prefix}' overlaps '{existing_prefix}' already "
+                    f"registered by plugin '{existing_plugin}'."
+                )
+        self._manager._telegram_callback_handlers.append(
+            (callback_prefix, callback, self.manifest.name)
+        )
+        logger.debug(
+            "Plugin %s registered Telegram callback handler: %s",
+            self.manifest.name,
+            callback_prefix,
+        )
+        return True
+
     # -- hook registration --------------------------------------------------
 
     # -- auxiliary task registration ---------------------------------------
@@ -3437,6 +3516,10 @@ class PluginManager:
         # ``re.Pattern``, or a constraint dict); ``callback`` is an async
         # function with the slack_bolt signature ``(ack, body, action)``.
         self._slack_action_handlers: List[tuple] = []
+        # Telegram inline-keyboard callbacks registered by plugins. Each entry
+        # is (callback_data_prefix, async_callback, plugin_name). The Telegram
+        # adapter invokes matching callbacks after its standard authorization.
+        self._telegram_callback_handlers: List[tuple] = []
         # Registration handles are kept both per plugin (ownership lookup) and
         # globally (reverse-order teardown for overrides spanning plugins).
         #
@@ -3725,6 +3808,7 @@ class PluginManager:
             self._system_prompt_sections.clear()
             self._approval_transports.clear()
             self._slack_action_handlers.clear()
+            self._telegram_callback_handlers.clear()
             self._predeclared_modules.clear()
             self._predeclared_tools.clear()
             self._context_engine = None
@@ -5450,6 +5534,10 @@ class PluginManager:
         :meth:`PluginContext.register_slack_action_handler`.
         """
         return list(self._slack_action_handlers)
+
+    def get_telegram_callback_handlers(self) -> List[tuple]:
+        """Return a copy of plugin-registered Telegram callback handlers."""
+        return list(self._telegram_callback_handlers)
 
     # -----------------------------------------------------------------------
     # Introspection

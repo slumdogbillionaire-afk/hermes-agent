@@ -1454,8 +1454,66 @@ class BaseEnvironment(ABC):
             proc, timeout=effective_timeout, bounded_capture=bounded_capture
         )
         self._update_cwd(result)
+        self._maybe_capture_shell_syntax_error(command, wrapped, effective_cwd, login, result)
 
         return result
+
+    # Signatures of the specific unreproduced heredoc/SSH-quoting failure
+    # class from the 2026-08-19 capability repair (D-199): repeated attempts
+    # to reproduce via CRLF injection and the _wrap_command single-quote
+    # escaping both came back clean, so the real trigger needs a real raw
+    # command string to diagnose rather than another guess.
+    _SHELL_SYNTAX_ERROR_MARKERS = (
+        "unexpected EOF while looking for matching",
+        "unterminated string literal",
+        "unterminated quoted string",
+    )
+
+    def _maybe_capture_shell_syntax_error(
+        self, command: str, wrapped: str, cwd: str, login: bool, result: dict,
+    ) -> None:
+        """Bounded, self-disabling diagnostic capture (D-199 follow-up).
+
+        Fires at most ONCE per machine (guarded by a sentinel file, checked
+        first so this is a no-op on every call after the first capture — not
+        a standing log). Writes the exact raw command bytes behind the next
+        real heredoc/SSH-quoting failure, since two independent
+        reconstructed hypotheses failed to reproduce it directly. Delete the
+        capture file to re-arm; this is meant to be removed once it has
+        caught one real sample, not left on permanently.
+        """
+        if result.get("returncode", 0) == 0:
+            return
+        output = result.get("output", "") or ""
+        if not any(marker in output for marker in self._SHELL_SYNTAX_ERROR_MARKERS):
+            return
+        capture_path = get_hermes_home() / "state" / "shell_syntax_error_capture.json"
+        if capture_path.exists():
+            return
+        try:
+            capture_path.parent.mkdir(parents=True, exist_ok=True)
+            capture_path.write_text(
+                json.dumps(
+                    {
+                        "backend": type(self).__name__,
+                        "login": login,
+                        "cwd": cwd,
+                        "raw_command_repr": repr(command),
+                        "wrapped_command_repr": repr(wrapped),
+                        "returncode": result.get("returncode"),
+                        "output_tail": output[-2000:],
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            logger.warning(
+                "Captured a shell syntax error sample to %s (one-shot; "
+                "delete the file to re-arm this capture) — see D-199.",
+                capture_path,
+            )
+        except OSError:
+            logger.debug("Shell syntax error capture failed to write", exc_info=True)
 
     # ------------------------------------------------------------------
     # Shared helpers

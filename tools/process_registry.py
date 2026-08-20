@@ -2605,6 +2605,7 @@ class ProcessRegistry:
             return 0
 
         recovered = 0
+        recovered_lost = 0
         unresolved_scope_entries: List[Dict[str, Any]] = []
         for entry in entries:
             pid = entry.get("pid")
@@ -2648,6 +2649,71 @@ class ProcessRegistry:
                         pid,
                     )
                     unresolved_scope_entries.append(entry)
+
+                # 2026-08-19 capability repair: a job that finished (or died)
+                # DURING the gateway's downtime falls through this branch with
+                # a truly-dead, non-recycled PID -- previously that meant the
+                # checkpoint entry was just dropped, silently, even when it
+                # had notify_on_complete set. Deliver a best-effort "lost
+                # during restart" notice instead of staying silent (ticket:
+                # "background jobs exited without surfacing results, Adam has
+                # to manually check"). We cannot recover the real exit code or
+                # output -- nothing was watching -- so this is honest about
+                # that rather than guessing success/failure.
+                if (
+                    entry.get("notify_on_complete")
+                    and pid_scope == "host"
+                    and not self._is_host_pid_alive(pid)
+                    and entry.get("watcher_platform")
+                    and entry.get("watcher_chat_id")
+                ):
+                    lost_session = ProcessSession(
+                        id=entry["session_id"],
+                        command=entry.get("command", "unknown"),
+                        task_id=entry.get("task_id", ""),
+                        session_key=entry.get("session_key", ""),
+                        pid=pid,
+                        host_start_time=recorded_start,
+                        pid_scope=pid_scope,
+                        cwd=entry.get("cwd"),
+                        started_at=entry.get("started_at", time.time()),
+                        detached=True,
+                    )
+                    lost_session.exited = True
+                    lost_session.exit_code = None
+                    lost_session.completion_reason = "lost"
+                    lost_session.termination_source = "gateway_restart"
+                    lost_session.output_buffer = (
+                        "[gateway restarted while this process was running; "
+                        "its final status could not be determined]"
+                    )
+                    with self._lock:
+                        self._finished[lost_session.id] = lost_session
+                    self.pending_watchers.append({
+                        "session_id": lost_session.id,
+                        "check_interval": max(5, entry.get("watcher_interval", 0) or 5),
+                        "session_key": lost_session.session_key,
+                        "platform": entry.get("watcher_platform", ""),
+                        "chat_id": entry.get("watcher_chat_id", ""),
+                        "user_id": entry.get("watcher_user_id", ""),
+                        "user_name": entry.get("watcher_user_name", ""),
+                        "thread_id": entry.get("watcher_thread_id", ""),
+                        "message_id": entry.get("watcher_message_id", ""),
+                        # Deliberately False, even though the original job
+                        # requested True: this session never had (and never
+                        # will have) a live agent turn to inject into, so
+                        # agent-injection delivery has no route and the
+                        # watcher's agent_notify branch would retry forever
+                        # with nothing ever delivered. Plain notify_mode
+                        # delivery (adapter.send() directly) is the only path
+                        # that can actually reach Adam for a cold recovery.
+                        "notify_on_complete": False,
+                    })
+                    recovered_lost += 1
+                    logger.info(
+                        "Notifying about session %s lost during gateway restart "
+                        "(pid %s no longer alive)", lost_session.id, pid,
+                    )
                 continue
 
             session = ProcessSession(
@@ -2695,6 +2761,13 @@ class ProcessRegistry:
                 })
 
         self._write_checkpoint(extra_entries=unresolved_scope_entries)
+
+        if recovered_lost:
+            logger.info(
+                "Queued %d lost-during-restart notification(s) for background "
+                "processes that finished while the gateway was down",
+                recovered_lost,
+            )
 
         return recovered
 

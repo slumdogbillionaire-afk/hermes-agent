@@ -52,3 +52,40 @@ async def test_send_short_circuits_when_path_degraded():
     adapter._bot.send_message.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_send_image_file_short_circuits_when_path_degraded():
+    """2026-08-19 capability repair: send_image_file had no degraded-path
+    check, so a batch of images sent after a mid-turn reconnect would each
+    attempt real send_photo I/O and time out individually instead of
+    failing fast -- the "only one image sporadically sends" symptom."""
+    adapter = _make_adapter()
+    adapter._bot.send_photo = AsyncMock(return_value=MagicMock(message_id=1))
+    adapter._send_path_degraded = True
+
+    result = await adapter.send_image_file("123", "C:/fake/path.png")
+
+    assert result.success is False
+    assert result.error == "send_path_degraded"
+    assert result.retryable is True
+    adapter._bot.send_photo.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_multiple_images_falls_back_fast_when_path_degraded():
+    """send_multiple_images must not attempt send_media_group against a
+    degraded connection; it should fall straight to the base per-image
+    loop, which itself now fails fast via send_image_file's new check."""
+    adapter = _make_adapter()
+    adapter._bot.send_media_group = AsyncMock()
+    adapter._bot.send_photo = AsyncMock()
+    adapter._send_path_degraded = True
+
+    with patch.object(
+        adapter.__class__.__bases__[0], "send_multiple_images", AsyncMock()
+    ) as base_send:
+        await adapter.send_multiple_images("123", [("file:///fake.png", "alt")])
+
+    adapter._bot.send_media_group.assert_not_awaited()
+    base_send.assert_awaited_once()
+
+

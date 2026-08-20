@@ -961,6 +961,63 @@ class TestCheckpoint:
             recovered = registry.recover_from_checkpoint()
             assert recovered == 0
 
+    def test_recover_dead_pid_with_notify_queues_lost_notification(self, registry, tmp_path):
+        """2026-08-19 capability repair: a notify_on_complete job that finishes
+        (or dies) DURING the gateway's downtime previously vanished with no
+        notification at all -- the dead-PID branch just `continue`d. It should
+        now synthesize a finished/lost session and queue a plain (non-agent-
+        injection) watcher so Adam still hears about it."""
+        checkpoint = tmp_path / "procs.json"
+        checkpoint.write_text(json.dumps([{
+            "session_id": "proc_dead_notify",
+            "command": "python render.py",
+            "pid": 999999999,  # almost certainly not running
+            "task_id": "t1",
+            "pid_scope": "host",
+            "notify_on_complete": True,
+            "watcher_platform": "telegram",
+            "watcher_chat_id": "7758316507",
+            "watcher_interval": 30,
+        }]))
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            recovered = registry.recover_from_checkpoint()
+            # Not counted as a live recovery -- it's not adopted as running.
+            assert recovered == 0
+
+        session = registry.get("proc_dead_notify")
+        assert session is not None
+        assert session.exited is True
+        assert session.exit_code is None
+        assert session.completion_reason == "lost"
+        assert "gateway restarted" in session.output_buffer
+
+        watchers = [w for w in registry.pending_watchers if w["session_id"] == "proc_dead_notify"]
+        assert len(watchers) == 1
+        watcher = watchers[0]
+        assert watcher["platform"] == "telegram"
+        assert watcher["chat_id"] == "7758316507"
+        # Deliberately False: no live agent turn exists for a cold recovery,
+        # so this must route through the plain adapter.send() path, not
+        # agent-injection (which would retry forever with nothing delivered).
+        assert watcher["notify_on_complete"] is False
+
+    def test_recover_dead_pid_without_watcher_target_stays_silent(self, registry, tmp_path):
+        """No watcher_platform/chat_id means there's nowhere to deliver a
+        notification -- must not queue a watcher with an empty destination."""
+        checkpoint = tmp_path / "procs.json"
+        checkpoint.write_text(json.dumps([{
+            "session_id": "proc_dead_no_target",
+            "command": "python render.py",
+            "pid": 999999999,
+            "pid_scope": "host",
+            "notify_on_complete": True,
+        }]))
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            assert registry.recover_from_checkpoint() == 0
+
+        assert registry.get("proc_dead_no_target") is None
+        assert not [w for w in registry.pending_watchers if w["session_id"] == "proc_dead_no_target"]
+
     def test_recover_dead_wrapper_retries_unreaped_systemd_scope(
         self, registry, tmp_path, monkeypatch
     ):

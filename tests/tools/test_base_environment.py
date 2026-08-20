@@ -304,6 +304,70 @@ class TestSnapshotFileModes:
             os.umask(old_umask)
 
 
+class TestShellSyntaxErrorCapture:
+    """2026-08-19 capability repair (D-199 follow-up): bounded, self-disabling
+    diagnostic capture for the unreproduced heredoc/SSH-quoting failure
+    class. Must fire at most once and only on a real matching signature."""
+
+    def test_captures_on_matching_signature(self, tmp_path, monkeypatch):
+        import json as _json
+        from pathlib import Path as _Path
+
+        monkeypatch.setattr(
+            "tools.environments.base.get_hermes_home", lambda: tmp_path
+        )
+        env = _TestableEnv()
+        result = {
+            "returncode": 2,
+            "output": "bash: -c: line 5: unexpected EOF while looking for matching `''",
+        }
+
+        env._maybe_capture_shell_syntax_error(
+            "python3 - <<'PY'\nprint(1)\nPY", "eval 'wrapped'", "/tmp", False, result,
+        )
+
+        capture = tmp_path / "state" / "shell_syntax_error_capture.json"
+        assert capture.exists()
+        data = _json.loads(capture.read_text())
+        assert "unexpected EOF" in data["output_tail"]
+        assert "PY" in data["raw_command_repr"]
+
+    def test_does_not_fire_twice(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "tools.environments.base.get_hermes_home", lambda: tmp_path
+        )
+        env = _TestableEnv()
+        result = {"returncode": 2, "output": "unterminated string literal"}
+
+        env._maybe_capture_shell_syntax_error("cmd1", "wrapped1", "/tmp", False, result)
+        capture = tmp_path / "state" / "shell_syntax_error_capture.json"
+        first_write = capture.read_text()
+
+        env._maybe_capture_shell_syntax_error("cmd2", "wrapped2", "/tmp", False, result)
+        assert capture.read_text() == first_write  # untouched by the second failure
+
+    def test_ignores_success(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "tools.environments.base.get_hermes_home", lambda: tmp_path
+        )
+        env = _TestableEnv()
+        env._maybe_capture_shell_syntax_error(
+            "cmd", "wrapped", "/tmp", False, {"returncode": 0, "output": ""},
+        )
+        assert not (tmp_path / "state" / "shell_syntax_error_capture.json").exists()
+
+    def test_ignores_unrelated_failure(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "tools.environments.base.get_hermes_home", lambda: tmp_path
+        )
+        env = _TestableEnv()
+        env._maybe_capture_shell_syntax_error(
+            "cmd", "wrapped", "/tmp", False,
+            {"returncode": 1, "output": "command not found: foo"},
+        )
+        assert not (tmp_path / "state" / "shell_syntax_error_capture.json").exists()
+
+
 class TestExtractCwdFromOutput:
     def test_happy_path(self):
         env = _TestableEnv()
