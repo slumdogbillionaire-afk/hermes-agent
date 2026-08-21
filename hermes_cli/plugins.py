@@ -360,6 +360,12 @@ VALID_HOOKS: Set[str] = {
     #       payload contracts; no inert VALID_HOOKS surface is registered
     #       ahead of implementation.
     "gateway_platform_event",
+    # In-process gateway lifecycle hook. Fired exactly once by GatewayRunner
+    # after platform adapters connect and the gateway:startup event is emitted.
+    # Kwargs: gateway (the live GatewayRunner object). Return values are
+    # ignored. The live object makes this intentionally unavailable to shell
+    # hooks (see SHELL_UNSUPPORTED_HOOKS).
+    "gateway_startup",
     # Slash-command dispatch observer (#64204, observer-first per #64182
     # ground rule 3). Fired when a recognized slash command is about to be
     # dispatched, BEFORE the handler runs, on both the interactive CLI
@@ -388,6 +394,7 @@ VALID_HOOKS: Set[str] = {
 # have its output silently ignored — registration is refused loudly instead.
 # Support for a shell response shape can lift an event out of this set.
 SHELL_UNSUPPORTED_HOOKS: Set[str] = {
+    "gateway_startup",
     "transform_api_error_classification",
 }
 
@@ -2996,8 +3003,18 @@ class PluginContext:
                     f"'{callback_prefix}' overlaps '{existing_prefix}' already "
                     f"registered by plugin '{existing_plugin}'."
                 )
-        self._manager._telegram_callback_handlers.append(
-            (callback_prefix, callback, self.manifest.name)
+        entry = (callback_prefix, callback, self.manifest.name)
+        self._manager._telegram_callback_handlers.append(entry)
+        # Preserve the historical ``True`` return contract while still making
+        # callbacks first-class, owner-scoped registrations. Failed plugin
+        # loads and per-plugin unload now remove only this exact tuple by
+        # identity; PluginRegistration disposal is idempotent.
+        self._track(
+            "telegram_callback_handler",
+            callback_prefix,
+            lambda: self._manager._remove_identity(
+                self._manager._telegram_callback_handlers, entry
+            ),
         )
         logger.debug(
             "Plugin %s registered Telegram callback handler: %s",

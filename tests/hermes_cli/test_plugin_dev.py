@@ -76,6 +76,28 @@ def test_doctor_accepts_manifest_defaults_from_runtime_parser(tmp_path: Path) ->
     assert report.manifest.kind == "standalone"
 
 
+def test_doctor_accepts_gateway_startup_as_in_process_hook(tmp_path: Path) -> None:
+    from hermes_cli.plugin_dev import doctor_plugin
+
+    plugin = tmp_path / "startup-plugin"
+    plugin.mkdir()
+    (plugin / "plugin.yaml").write_text(
+        "name: startup-plugin\nprovides_hooks: [gateway_startup]\n",
+        encoding="utf-8",
+    )
+    (plugin / "__init__.py").write_text(
+        "def startup(*, gateway, **kwargs):\n    return None\n\n"
+        "def register(ctx):\n"
+        "    ctx.register_hook('gateway_startup', startup)\n",
+        encoding="utf-8",
+    )
+
+    report = doctor_plugin(plugin)
+
+    assert report.ok, report.format_text()
+    assert report.registered_hooks == ("gateway_startup",)
+
+
 def test_doctor_restores_global_tool_policy_and_module_state(tmp_path: Path) -> None:
     import sys
 
