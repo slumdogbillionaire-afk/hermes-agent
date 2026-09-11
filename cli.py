@@ -2363,6 +2363,7 @@ def _cleanup_worktree(info: Dict[str, str] = None) -> None:
     work lives in commits/PRs, not the working tree.
     """
     global _active_worktree
+
     info = info or _active_worktree
     if not info:
         return
@@ -4865,6 +4866,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         checkpoints: bool = False,
         pass_session_id: bool = False,
         ignore_rules: bool = False,
+        memory_read_only: bool = False,
     ):
         """
         Initialize the Hermes CLI.
@@ -5162,6 +5164,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # by `hermes chat --ignore-rules` in hermes_cli/main.py. When true we
         # pass skip_context_files=True and skip_memory=True to AIAgent so
         # AGENTS.md/SOUL.md/.cursorrules and persistent memory are not loaded.
+        self.memory_read_only = bool(memory_read_only)
         self.ignore_rules = ignore_rules or os.environ.get("HERMES_IGNORE_RULES") == "1"
         
         # Ephemeral system prompt: env var takes precedence, then
@@ -15948,6 +15951,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         persist_user_message=_persist_clean_user_message,
                         moa_config=_moa_cfg,
                     )
+                    if getattr(self, "_single_query_mode", False):
+                        self._single_query_result = result
                     if getattr(self, "_pending_moa_disable_after_turn", False):
                         _restore = getattr(self, "_pending_moa_restore_model", None) or {}
                         for _key, _value in _restore.items():
@@ -20196,6 +20201,8 @@ def main(
     pass_session_id: bool = False,
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
+    memory_read_only: bool = False,
+    result_file: str = None,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -20232,6 +20239,13 @@ def main(
         python cli.py -w -q "Fix issue #123"     # Single query in worktree
     """
     global _active_worktree
+
+    from hermes_cli.result_receipt import validate_result_path
+    if (memory_read_only or result_file) and not (query or q or image):
+        raise ValueError("Read-only memory and result files require a single query")
+    if memory_read_only and (ignore_rules or os.environ.get("HERMES_IGNORE_RULES") == "1"):
+        raise ValueError("Read-only memory requires context and memory retrieval")
+    receipt_path = validate_result_path(result_file) if result_file else None
 
     # Force UTF-8 stdio on Windows before any banner/print() runs — the
     # Rich console prints Unicode box-drawing characters that would
@@ -20386,6 +20400,7 @@ def main(
         checkpoints=checkpoints,
         pass_session_id=pass_session_id,
         ignore_rules=ignore_rules,
+        memory_read_only=memory_read_only,
     )
 
     if parsed_skills:
@@ -20532,6 +20547,7 @@ def main(
     
     # Handle single query mode
     if query or image:
+        cli._single_query_result = None
         # One-shot mode: no between-turns MCP late-binding refresh, so the
         # agent must wait the full MCP cold-start bound before its first
         # (and only) tool snapshot. See #51316.
@@ -20669,6 +20685,7 @@ def main(
                                 conversation_history=cli.conversation_history,
                             )
                         except KeyboardInterrupt:
+                            cli._single_query_result = {"interrupted": True}
                             _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
                             print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
                             sys.exit(130)
@@ -20681,6 +20698,7 @@ def main(
                             and cli.agent.session_id != cli.session_id
                         ):
                             cli.session_id = cli.agent.session_id
+                        cli._single_query_result = result
                         response = result.get("final_response", "") if isinstance(result, dict) else str(result)
                         # Surface backend errors that produced no visible output
                         # (e.g. invalid model slug → provider 4xx). Mirrors the
@@ -20763,8 +20781,17 @@ def main(
                 cli._show_security_advisories()
                 cli.chat(query, images=single_query_images or None)
                 cli._print_exit_summary(clear_screen=False)
+        except KeyboardInterrupt:
+            cli._single_query_result = {"interrupted": True}
+            raise
         finally:
-            _finalize_single_query(cli)
+            try:
+                _finalize_single_query(cli)
+            finally:
+                if receipt_path is not None:
+                    from hermes_cli.result_receipt import write_result_receipt
+                    sid = getattr(getattr(cli, "agent", None), "session_id", None) or cli.session_id
+                    write_result_receipt(receipt_path, cli._single_query_result, sid)
         return
     
     # Run interactive mode

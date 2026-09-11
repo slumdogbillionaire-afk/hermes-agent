@@ -368,7 +368,8 @@ class MemoryManager:
     provider is allowed.  Failures in one provider never block the other.
     """
 
-    def __init__(self, *, external_prefetch_timeout: Optional[float] = None) -> None:
+    def __init__(self, *, external_prefetch_timeout: Optional[float] = None, read_only: bool = False) -> None:
+        self.read_only = bool(read_only)
         self._providers: List[MemoryProvider] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
         self._has_external: bool = False  # True once a non-builtin provider is added
@@ -426,6 +427,8 @@ class MemoryManager:
             self._has_external = True
 
         self._providers.append(provider)
+        if self.read_only:
+            return
 
         # Core tool names are reserved — a memory provider must never register
         # a tool that shadows a built-in (e.g. ``clarify``, ``delegate_task``).
@@ -547,7 +550,7 @@ class MemoryManager:
     def _prefetch_provider(
         self, provider: MemoryProvider, query: str, *, session_id: str = ""
     ) -> str:
-        if provider.name == "builtin":
+        if self.read_only or provider.name == "builtin":
             return provider.prefetch(query, session_id=session_id)
 
         result_box: Dict[str, str] = {}
@@ -638,6 +641,8 @@ class MemoryManager:
         wedged provider can never block the caller. See ``sync_all`` for
         the full rationale (agent stuck "running" minutes after a turn).
         """
+        if self.read_only:
+            return
         providers = list(self._providers)
         if not providers:
             return
@@ -697,6 +702,8 @@ class MemoryManager:
         before turn N+1; provider implementations don't need their own
         ordering guarantees.
         """
+        if self.read_only:
+            return
         providers = list(self._providers)
         if not providers:
             return
@@ -742,6 +749,8 @@ class MemoryManager:
         wrap, a provider resolving ambient state (config paths, secrets)
         from the worker would silently land on the default profile.
         """
+        if self.read_only:
+            return
         import contextvars
         from functools import partial
 
@@ -815,6 +824,8 @@ class MemoryManager:
         exists), False on timeout. Used at real session boundaries and by
         tests that need to assert provider state deterministically.
         """
+        if self.read_only:
+            return True
         executor = self._sync_executor
         if executor is None:
             return True
@@ -839,6 +850,8 @@ class MemoryManager:
         :meth:`add_provider`, so the manager must not advertise a schema it
         will never route. Built-ins always win (#40466).
         """
+        if self.read_only:
+            return []
         from toolsets import _HERMES_CORE_TOOLS
 
         _core_tool_names = set(_HERMES_CORE_TOOLS)
@@ -903,6 +916,8 @@ class MemoryManager:
 
         kwargs may include: remaining_tokens, model, platform, tool_count.
         """
+        if self.read_only:
+            return
         for provider in self._providers:
             try:
                 provider.on_turn_start(turn_number, message, **kwargs)
@@ -914,6 +929,8 @@ class MemoryManager:
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Notify all providers of session end."""
+        if self.read_only:
+            return
         for provider in self._providers:
             try:
                 provider.on_session_end(messages)
@@ -952,6 +969,8 @@ class MemoryManager:
         ``_submit_background`` degrades to inline execution — the pre-#16454
         synchronous behavior, slow but correct.
         """
+        if self.read_only:
+            return
         if not self._providers:
             return
         snapshot = list(messages or [])
@@ -997,6 +1016,8 @@ class MemoryManager:
         transcript was truncated; providers caching per-turn document
         state should invalidate.
         """
+        if self.read_only:
+            return
         if not new_session_id:
             return
         # Only forward ``rewound`` when it's actually set. Passing it
@@ -1027,6 +1048,8 @@ class MemoryManager:
         Returns combined text from providers to include in the compression
         summary prompt. Empty string if no provider contributes.
         """
+        if self.read_only:
+            return ""
         parts = []
         for provider in self._providers:
             try:
@@ -1077,6 +1100,8 @@ class MemoryManager:
 
         Skips the builtin provider itself (it's the source of the write).
         """
+        if self.read_only:
+            return
         for provider in self._providers:
             if provider.name == "builtin":
                 continue
@@ -1143,6 +1168,8 @@ class MemoryManager:
         session/task/tool-call provenance the manager does not) invoked once per
         mirrored op.
         """
+        if self.read_only:
+            return
         if not self._memory_tool_result_succeeded(tool_result):
             return
 
@@ -1180,6 +1207,8 @@ class MemoryManager:
     def on_delegation(self, task: str, result: str, *,
                       child_session_id: str = "", **kwargs) -> None:
         """Notify all providers that a subagent completed."""
+        if self.read_only:
+            return
         for provider in self._providers:
             try:
                 provider.on_delegation(
@@ -1200,6 +1229,9 @@ class MemoryManager:
         daemon, so anything still wedged past the drain window dies with
         the interpreter rather than blocking exit.
         """
+        if self.read_only:
+            self._drain_sync_executor()
+            return
         self._drain_sync_executor()
         for provider in reversed(self._providers):
             try:
@@ -1282,6 +1314,9 @@ class MemoryManager:
             from hermes_constants import get_hermes_home
             kwargs["hermes_home"] = str(get_hermes_home())
         for provider in self._providers:
+            if self.read_only:
+                provider.initialize_read_only(session_id=session_id, **kwargs)
+                continue
             try:
                 provider.initialize(session_id=session_id, **kwargs)
             except Exception as e:

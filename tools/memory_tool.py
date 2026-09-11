@@ -162,7 +162,8 @@ class MemoryStore:
     # turn to budget exhaustion and suppress the user's reply (issue #42405).
     _MAX_CONSOLIDATION_FAILURES_PER_TURN = 3
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
+    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375, *, read_only: bool = False):
+        self.read_only = bool(read_only)
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
@@ -218,7 +219,8 @@ class MemoryStore:
         stable for the entire session (prefix-cache invariant holds).
         """
         mem_dir = get_memory_dir()
-        mem_dir.mkdir(parents=True, exist_ok=True)
+        if not self.read_only:
+            mem_dir.mkdir(parents=True, exist_ok=True)
 
         self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
         self.user_entries = self._read_file(mem_dir / "USER.md")
@@ -362,6 +364,8 @@ class MemoryStore:
 
     def save_to_disk(self, target: str):
         """Persist entries to the appropriate file. Called after every mutation."""
+        if self.read_only:
+            raise PermissionError("Memory is read-only for this session")
         get_memory_dir().mkdir(parents=True, exist_ok=True)
         self._write_file(self._path_for(target), self._entries_for(target))
 
@@ -389,6 +393,8 @@ class MemoryStore:
 
     def add(self, target: str, content: str) -> Dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
+        if self.read_only:
+            return {"success": False, "error": "Memory is read-only for this session"}
         content = content.strip()
         if not content:
             return {"success": False, "error": "Content cannot be empty."}
@@ -448,6 +454,8 @@ class MemoryStore:
 
     def replace(self, target: str, old_text: str, new_content: str) -> Dict[str, Any]:
         """Find entry containing old_text substring, replace it with new_content."""
+        if self.read_only:
+            return {"success": False, "error": "Memory is read-only for this session"}
         old_text = old_text.strip()
         new_content = new_content.strip()
         if not old_text:
@@ -519,6 +527,8 @@ class MemoryStore:
 
     def remove(self, target: str, old_text: str) -> Dict[str, Any]:
         """Remove the entry containing old_text substring."""
+        if self.read_only:
+            return {"success": False, "error": "Memory is read-only for this session"}
         old_text = old_text.strip()
         if not old_text:
             return {"success": False, "error": "old_text cannot be empty."}
@@ -572,6 +582,8 @@ class MemoryStore:
         the net result would exceed the char limit, NOTHING is written and an
         error is returned describing the first failure plus the live state.
         """
+        if self.read_only:
+            return {"success": False, "error": "Memory is read-only for this session"}
         if not operations:
             return {"success": False, "error": "operations list is empty."}
 
@@ -1081,6 +1093,8 @@ def memory_tool(
     """
     if store is None:
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
+    if store.read_only:
+        return tool_error("Memory is read-only for this session", success=False)
 
     # Accept new_text as an alias for content (single-op path). See docstring.
     if content is None and new_text is not None:

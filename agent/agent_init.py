@@ -575,6 +575,7 @@ def init_agent(
     skip_context_files: bool = False,
     load_soul_identity: bool = False,
     skip_memory: bool = False,
+    memory_read_only: bool = False,
     skip_background_review: bool = False,
     session_db=None,
     parent_session_id: str = None,
@@ -638,6 +639,9 @@ def init_agent(
             identity even when skip_context_files=True. Project context files from the cwd
             remain skipped.
     """
+    if session_db is not None and session_id:
+        session_db.require_session_memory_mode(session_id, memory_read_only)
+    agent.memory_read_only = bool(memory_read_only)
     _install_safe_stdio()
 
     agent.model = model
@@ -674,7 +678,7 @@ def init_agent(
     # provide no value (no human in the loop, no skill-creation pressure).
     # skip_memory=True already disables the memory-review trigger; this
     # flag is the explicit single-switch off for both review paths.
-    agent.skip_background_review = bool(skip_background_review)
+    agent.skip_background_review = bool(skip_background_review or memory_read_only)
     agent.pass_session_id = pass_session_id
     agent.log_prefix_chars = log_prefix_chars
     agent.log_prefix = f"{log_prefix} " if log_prefix else ""
@@ -1720,6 +1724,7 @@ def init_agent(
     # the user's real session and hijack the next live turn. Default False.
     agent._persist_disabled = False
     agent._session_init_model_config = {
+        "memory_read_only": bool(memory_read_only),
         "max_iterations": agent.max_iterations,
         "reasoning_config": reasoning_config,
         "max_tokens": max_tokens,
@@ -1818,6 +1823,7 @@ def init_agent(
                 agent._memory_store = MemoryStore(
                     memory_char_limit=mem_config.get("memory_char_limit", 2200),
                     user_char_limit=mem_config.get("user_char_limit", 1375),
+                    read_only=memory_read_only,
                 )
                 agent._memory_store.load_from_disk()
         except Exception:
@@ -1835,7 +1841,7 @@ def init_agent(
             if _mem_provider_name and _mem_provider_name.strip():
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from plugins.memory import load_memory_provider as _load_mem
-                agent._memory_manager = _MemoryManager()
+                agent._memory_manager = _MemoryManager(read_only=memory_read_only)
                 _mp = _load_mem(_mem_provider_name)
                 if _mp and _mp.is_available():
                     agent._memory_manager.add_provider(_mp)
@@ -1906,6 +1912,8 @@ def init_agent(
                     _ra().logger.debug("Memory provider '%s' not found or not available", _mem_provider_name)
                     agent._memory_manager = None
         except Exception as _mpe:
+            if memory_read_only:
+                raise ValueError("Read-only memory provider initialization failed") from _mpe
             _ra().logger.warning("Memory provider plugin init failed: %s", _mpe)
             agent._memory_manager = None
 

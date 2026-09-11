@@ -1779,7 +1779,7 @@ def _resolve_session_by_name_or_id(name_or_id: str) -> Optional[str]:
     return None
 
 
-def _create_titled_session(title: str) -> Optional[str]:
+def _create_titled_session(title: str, *, memory_read_only: bool = False) -> Optional[str]:
     """Create a fresh session with the given title; return its session id.
 
     Used by ``chat -c <title> --create-if-missing`` (#86794): programmatic
@@ -1802,7 +1802,8 @@ def _create_titled_session(title: str) -> Optional[str]:
         new_session_id = f"{timestamp_str}_{short_uuid}"
 
         db = SessionDB()
-        db.create_session(new_session_id, source="cli")
+        db.create_session(new_session_id, source="cli",
+                          model_config={"memory_read_only": bool(memory_read_only)})
         db.set_session_title(new_session_id, title)
         return new_session_id
     except Exception:
@@ -1845,7 +1846,9 @@ def _resolve_continue_arg(args, *, use_tui: bool) -> None:
                 # programmatic-caller primitive ("send to this named thread,
                 # making it if needed"); without it a background/quiet send to
                 # a not-yet-existing named session silently no-ops (#86794).
-                new_sid = _create_titled_session(continue_val)
+                new_sid = (_create_titled_session(continue_val, memory_read_only=True)
+                           if getattr(args, "memory_read_only", False)
+                           else _create_titled_session(continue_val))
                 if new_sid:
                     args.resume = new_sid
                 else:
@@ -2929,7 +2932,18 @@ def _resolve_use_tui(args) -> bool:
 
 def cmd_chat(args):
     """Run interactive chat CLI."""
+    if getattr(args, "memory_read_only", False) or getattr(args, "result_file", None):
+        if not (getattr(args, "query", None) or getattr(args, "query_file", None)
+                or getattr(args, "image", None)):
+            raise ValueError("Read-only memory and result files require a single query")
+        if getattr(args, "tui", False):
+            raise ValueError("Read-only memory and result files require the classic CLI")
+        if getattr(args, "result_file", None):
+            from hermes_cli.result_receipt import validate_result_path
+            validate_result_path(args.result_file)
     use_tui = _resolve_use_tui(args)
+    if getattr(args, "memory_read_only", False) or getattr(args, "result_file", None):
+        use_tui = False
 
     _apply_safe_mode(args)
 
@@ -3012,6 +3026,16 @@ def cmd_chat(args):
             args.resume = resolved
         # If resolution fails, keep the original value — _init_agent will
         # report "Session not found" with the original input
+
+    if getattr(args, "resume", None):
+        from hermes_state import SessionDB
+        _mode_db = SessionDB()
+        try:
+            _mode_db.require_session_memory_mode(
+                args.resume, getattr(args, "memory_read_only", False)
+            )
+        finally:
+            _mode_db.close()
 
     # Session<->workspace binding: cd back into a resumed session's recorded cwd
     # so it resumes in the repo it belonged to. Opt out with --no-restore-cwd;
@@ -3221,6 +3245,8 @@ def cmd_chat(args):
         "pass_session_id": getattr(args, "pass_session_id", False),
         "max_turns": getattr(args, "max_turns", None),
         "run_budget": getattr(args, "run_budget", None),
+        "memory_read_only": getattr(args, "memory_read_only", False),
+        "result_file": getattr(args, "result_file", None),
         "ignore_rules": getattr(args, "ignore_rules", False) or getattr(args, "safe_mode", False),
         "ignore_user_config": getattr(args, "ignore_user_config", False) or getattr(args, "safe_mode", False),
         "compact": getattr(args, "compact", False),

@@ -499,6 +499,7 @@ class AIAgent:
         skip_context_files: bool = False,
         load_soul_identity: bool = False,
         skip_memory: bool = False,
+        memory_read_only: bool = False,
         skip_background_review: bool = False,
         session_db=None,
         parent_session_id: str = None,
@@ -589,6 +590,7 @@ class AIAgent:
             skip_context_files=skip_context_files,
             load_soul_identity=load_soul_identity,
             skip_memory=skip_memory,
+            memory_read_only=memory_read_only,
             skip_background_review=skip_background_review,
             session_db=session_db,
             parent_session_id=parent_session_id,
@@ -1861,6 +1863,8 @@ class AIAgent:
         # model and replays the whole conversation at premium rates, silently
         # inflating token cost (#85859). An explicit ``/refine`` (``focus`` set)
         # is a deliberate user request and still runs.
+        if getattr(self, "memory_read_only", False):
+            return
         if focus is None and getattr(self, "_delegate_depth", 0) > 0:
             return
         # Explicit off-switch for automatic post-turn forks

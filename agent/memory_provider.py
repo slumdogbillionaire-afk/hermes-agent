@@ -154,6 +154,16 @@ class MemoryProvider(ABC):
         """
         return ""
 
+    def initialize_read_only(self, session_id: str, **kwargs) -> None:
+        """Prepare retrieval without creating resources or starting writers.
+
+        Providers must explicitly implement this entry point before they can
+        serve read-only sessions. Their prompt and synchronous prefetch methods
+        must then perform retrieval only, including no durable cache writes.
+        The ordinary initialize/shutdown lifecycle is never called in this mode.
+        """
+        raise ValueError(f"Memory provider {self.name!r} does not support read-only sessions")
+
     def system_prompt_block(self) -> str:
         """Return text to include in the system prompt.
 

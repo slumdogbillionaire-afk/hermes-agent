@@ -1955,6 +1955,7 @@ def _build_child_agent(
                 platform="subagent",
                 skip_context_files=True,
                 skip_memory=True,
+                memory_read_only=getattr(parent_agent, "memory_read_only", False),
                 clarify_callback=None,
                 thinking_callback=child_thinking_cb,
                 session_db=child_session_db,

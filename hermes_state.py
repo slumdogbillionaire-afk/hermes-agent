@@ -7089,6 +7089,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
         self._execute_write(_do)
 
+    def require_session_memory_mode(self, session_id: str, read_only: bool) -> None:
+        """Reject mode changes on resume, including legacy normal sessions."""
+        session = self.get_session(session_id)
+        if session is None:
+            return
+        raw = session.get("model_config") or {}
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except (ValueError, TypeError) as exc:
+                raise ValueError("Invalid session memory mode") from exc
+        if not isinstance(raw, dict) or type(raw.get("memory_read_only", False)) is not bool:
+            raise ValueError("Invalid session memory mode")
+        if raw.get("memory_read_only", False) != bool(read_only):
+            raise ValueError("Session memory mode conflicts with --memory-read-only")
+
     @staticmethod
     def session_yolo_enabled(session_meta: Optional[Dict[str, Any]]) -> bool:
         """Read the persisted YOLO flag off a session row dict.

@@ -301,6 +301,14 @@ def build_top_level_parser():
         description="Start an interactive chat session with Hermes Agent",
     )
     _query_group = chat_parser.add_mutually_exclusive_group()
+    chat_parser.add_argument(
+        "--memory-read-only", action="store_true",
+        help="Retrieve memory without changing it (single-query mode only)",
+    )
+    chat_parser.add_argument(
+        "--result-file", metavar="PATH",
+        help="Write one atomic completion receipt to an absolute local path",
+    )
     _query_group.add_argument(
         "-q", "--query", help="Single query (non-interactive mode)"
     )
