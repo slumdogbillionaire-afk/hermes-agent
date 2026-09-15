@@ -5224,8 +5224,19 @@ def run_job(
                     logger.warning("Job '%s': failed to parse prefill messages file '%s': %s", job_id, pfpath, e)
                     prefill_messages = None
 
-        # Max iterations
-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 500
+        # A stored per-job override wins; absent jobs retain the exact global
+        # fallback chain. Validation also protects direct jobs.json edits before
+        # any agent/provider is constructed.
+        from cron.jobs import validate_job_max_iterations
+
+        if "max_iterations" in job:
+            max_iterations = validate_job_max_iterations(job["max_iterations"])
+        else:
+            max_iterations = (
+                _cfg.get("agent", {}).get("max_turns")
+                or _cfg.get("max_turns")
+                or 500
+            )
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}

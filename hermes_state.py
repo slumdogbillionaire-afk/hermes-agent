@@ -7231,6 +7231,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         API call.  After close() has stopped the writer, falls back to the
         synchronous path and may raise like :meth:`update_token_counts`.
         """
+        # Mirror the original per-call delta before batching can coalesce
+        # adjacent calls. Ledger failures are advisory and never affect the DB
+        # accounting path or the owner lane.
+        if not kwargs.get("absolute"):
+            try:
+                from agent.usage_ledger import record_accounting_delta
+
+                record_accounting_delta(session_id, kwargs)
+            except Exception:
+                logger.warning("Usage ledger mirror failed (non-fatal)", exc_info=True)
+
         with self._token_queue_cond:
             thread = self._token_writer_thread
             writer_stopped = self._token_writer_stop and (
@@ -7789,6 +7800,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         if not session_id or not task:
             return
+        try:
+            from agent.usage_ledger import record_accounting_delta
+
+            record_accounting_delta(
+                session_id,
+                {
+                    "model": model,
+                    "billing_provider": billing_provider,
+                    "input_tokens": input_tokens or 0,
+                    "output_tokens": output_tokens or 0,
+                    "cache_read_tokens": cache_read_tokens or 0,
+                    "cache_write_tokens": cache_write_tokens or 0,
+                    "reasoning_tokens": reasoning_tokens or 0,
+                    "api_call_count": 1 if api_call_count is None else int(api_call_count),
+                },
+                task=task,
+            )
+        except Exception:
+            logger.warning("Auxiliary usage ledger mirror failed (non-fatal)", exc_info=True)
         # FK on session_model_usage.session_id → sessions.id: ensure the row
         # exists (same INSERT OR IGNORE guard update_token_counts uses — the
         # initial create_session() can fail under concurrent SQLite locking).

@@ -146,6 +146,19 @@ def finalize_turn(
         api_call_count >= agent.max_iterations
         or agent.iteration_budget.remaining <= 0
     )
+    if budget_exhausted and str(_turn_exit_reason) in {"unknown", "budget_exhausted"}:
+        try:
+            from agent.usage_ledger import record_run_status
+
+            record_run_status(
+                str(getattr(agent, "session_id", None) or ""),
+                model=getattr(agent, "model", None),
+                provider=getattr(agent, "provider", None),
+                task="iteration_budget",
+                status="prevented",
+            )
+        except Exception:
+            logger.warning("Usage ledger prevention mirror failed", exc_info=True)
     budget_fallback_eligible = (
         budget_exhausted
         and not interrupted

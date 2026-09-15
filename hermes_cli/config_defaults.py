@@ -25,6 +25,9 @@ DEFAULT_CONFIG = {
     "runtime": {
         "nofile_soft_limit": 4096,
     },
+    # Local, append-only, secret-free input for deterministic usage watchers.
+    # Advisory only: failures never block an agent turn.
+    "usage_ledger": {"enabled": True},
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.
     # None/0 = unbounded.
     "max_concurrent_sessions": None,

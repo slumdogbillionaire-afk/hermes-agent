@@ -1103,6 +1103,7 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
 _api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextVar(
     "api_agent_request_reservation", default=None
 )
+_api_turn_lease_generations = itertools.count(1)
 
 
 def _admit_api_agent_request(handler):
@@ -1126,9 +1127,41 @@ def _admit_api_agent_request(handler):
         reservation = {"active": True}
         token = _api_agent_request_reservation.set(reservation)
         self._pending_agent_requests += 1
+        turn_lease_token = None
         try:
+            # Explicit API session turns must join the same canonical lease
+            # domain as push-adapter gateway turns. Acquire before the handler's
+            # first transcript read so a wake self-post cannot load stale
+            # history and later win the final write.
+            session_id = str(
+                request.headers.get("X-Hermes-Session-Id", "")
+                or getattr(request, "match_info", {}).get("session_id", "")
+                or ""
+            ).strip()
+            gateway_runner = getattr(self, "gateway_runner", None)
+            lease_registry = getattr(gateway_runner, "_turn_leases", None)
+            if session_id and lease_registry is not None:
+                from gateway.turn_lease import TurnLeaseTimeoutError
+
+                try:
+                    turn_lease_token = await lease_registry.acquire(
+                        session_id,
+                        owner_key=f"api_server:{id(request)}",
+                        generation=next(_api_turn_lease_generations),
+                    )
+                except TurnLeaseTimeoutError:
+                    return web.json_response(
+                        _openai_error(
+                            "Another turn is still running on this session; retry shortly.",
+                            err_type="conflict_error",
+                            code="session_turn_busy",
+                        ),
+                        status=409,
+                    )
             return await handler(self, request, *args, **kwargs)
         finally:
+            if turn_lease_token is not None:
+                lease_registry.release(turn_lease_token)
             if reservation["active"]:
                 reservation["active"] = False
                 self._pending_agent_requests = max(0, self._pending_agent_requests - 1)

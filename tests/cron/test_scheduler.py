@@ -21,8 +21,46 @@ from cron.scheduler import (
     _summarize_cron_failure_for_delivery,
     run_job,
 )
+from cron.jobs import create_job, get_job, update_job
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
+
+
+@pytest.fixture()
+def tmp_cron_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+    return tmp_path
+
+
+class TestJobMaxIterations:
+    def test_absent_override_preserves_old_job_shape(self, tmp_cron_dir):
+        job = create_job(prompt="test message", schedule="30m", deliver="local")
+
+        assert "max_iterations" not in job
+        assert "max_iterations" not in get_job(job["id"])
+
+    def test_valid_override_round_trips_create_and_update(self, tmp_cron_dir):
+        job = create_job(
+            prompt="test message", schedule="30m", deliver="local", max_iterations=12
+        )
+        assert get_job(job["id"])["max_iterations"] == 12
+
+        updated = update_job(job["id"], {"max_iterations": 21})
+        assert updated["max_iterations"] == 21
+        assert get_job(job["id"])["max_iterations"] == 21
+
+    @pytest.mark.parametrize("value", [True, "4", 0, -1, 501, 1.5, None])
+    def test_invalid_override_refuses_without_mutating_job(self, tmp_cron_dir, value):
+        job = create_job(
+            prompt="test message", schedule="30m", deliver="local", max_iterations=8
+        )
+
+        with pytest.raises(ValueError):
+            update_job(job["id"], {"max_iterations": value})
+
+        assert get_job(job["id"])["max_iterations"] == 8
 
 
 class TestSummarizeCronFailureForDelivery:
@@ -649,6 +687,53 @@ class TestRunJobSessionPersistence:
         assert kwargs["skip_memory"] is True
         assert kwargs["enabled_toolsets"] == ["memory", "file"]
         assert "memory" in kwargs["disabled_toolsets"]
+
+    def test_run_job_uses_global_turn_limit_when_override_absent(self, tmp_path):
+        (tmp_path / "config.yaml").write_text(
+            "agent:\n  max_turns: 37\n", encoding="utf-8"
+        )
+        job = {"id": "global-limit", "name": "test", "prompt": "hello"}
+
+        with self._run_job_patches(tmp_path) as (_fake_db, mock_agent_cls):
+            success, _output, _final, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert mock_agent_cls.call_args.kwargs["max_iterations"] == 37
+
+    def test_run_job_uses_per_job_turn_limit(self, tmp_path):
+        (tmp_path / "config.yaml").write_text(
+            "agent:\n  max_turns: 37\n", encoding="utf-8"
+        )
+        job = {
+            "id": "bounded-job",
+            "name": "test",
+            "prompt": "hello",
+            "max_iterations": 9,
+        }
+
+        with self._run_job_patches(tmp_path) as (_fake_db, mock_agent_cls):
+            success, _output, _final, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert mock_agent_cls.call_args.kwargs["max_iterations"] == 9
+
+    @pytest.mark.parametrize("value", [True, "9", 0, -1, 501, 2.5, None])
+    def test_run_job_refuses_invalid_stored_turn_limit(self, tmp_path, value):
+        job = {
+            "id": "invalid-limit",
+            "name": "test",
+            "prompt": "hello",
+            "max_iterations": value,
+        }
+
+        with self._run_job_patches(tmp_path) as (_fake_db, mock_agent_cls):
+            success, _output, _final, error = run_job(job)
+
+        assert success is False
+        assert "max_iterations" in error
+        mock_agent_cls.assert_not_called()
 
     def test_tick_skips_due_jobs_while_dispatch_is_paused(self, tmp_path):
         """The drain gate runs before advancing a due job's schedule."""

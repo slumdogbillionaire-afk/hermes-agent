@@ -9,6 +9,7 @@ Two strategies:
 """
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -51,6 +52,83 @@ def _source():
 def test_adapter_supports_push_default_true():
     assert adapter_supports_push(PushAdapter()) is True
     assert adapter_supports_push(ApiServerLikeAdapter()) is False
+
+
+def test_deliver_wake_push_path_still_uses_existing_message_handler():
+    adapter = PushAdapter()
+    source = _source()
+
+    asyncio.run(deliver_wake(adapter, text="background complete", source=source))
+
+    assert len(adapter.handled) == 1
+    event = adapter.handled[0]
+    assert event.text == "background complete"
+    assert event.source is source
+    assert event.internal is True
+
+
+def test_api_owner_turn_and_background_wake_serialize_transcript():
+    from gateway.platforms.api_server import _admit_api_agent_request
+    from gateway.turn_lease import SessionTurnLeaseRegistry
+
+    transcript = []
+    snapshots = {}
+    owner_entered = asyncio.Event()
+    release_owner = asyncio.Event()
+
+    class AdmissionAdapter:
+        def __init__(self):
+            self._pending_agent_requests = 0
+            self.gateway_runner = SimpleNamespace(
+                _turn_leases=SessionTurnLeaseRegistry()
+            )
+
+        def _check_auth(self, _request):
+            return None
+
+        def _draining_response(self):
+            return None
+
+        @_admit_api_agent_request
+        async def run_turn(self, request):
+            snapshots[request.label] = list(transcript)
+            if request.label == "owner":
+                owner_entered.set()
+                await release_owner.wait()
+            transcript.extend(
+                [("user", request.label), ("assistant", request.label + "-reply")]
+            )
+
+    def request(label):
+        return SimpleNamespace(
+            label=label,
+            headers={"X-Hermes-Session-Id": "shared-session"},
+            match_info={},
+        )
+
+    async def run():
+        adapter = AdmissionAdapter()
+        owner = asyncio.create_task(adapter.run_turn(request("owner")))
+        await owner_entered.wait()
+        wake = asyncio.create_task(adapter.run_turn(request("wake")))
+        await asyncio.sleep(0)
+        assert "wake" not in snapshots
+        release_owner.set()
+        await asyncio.gather(owner, wake)
+        assert adapter._pending_agent_requests == 0
+
+    asyncio.run(run())
+    assert snapshots["owner"] == []
+    assert snapshots["wake"] == [
+        ("user", "owner"),
+        ("assistant", "owner-reply"),
+    ]
+    assert transcript == [
+        ("user", "owner"),
+        ("assistant", "owner-reply"),
+        ("user", "wake"),
+        ("assistant", "wake-reply"),
+    ]
 
 
 async def _serve(handler):
@@ -98,8 +176,9 @@ def test_deliver_wake_non_push_self_posts_raw_session_id(monkeypatch):
     ]
 
 
-def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
-    """HTTP 429 (max_concurrent_runs cap) is transient — retried with backoff."""
+@pytest.mark.parametrize("busy_status", [409, 429])
+def test_deliver_wake_retries_busy_status_then_succeeds(monkeypatch, busy_status):
+    """Session-lease and global concurrency responses are retried."""
     from aiohttp import web
 
     import gateway.wake as wake_mod
@@ -110,7 +189,7 @@ def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
     async def handler(request):
         calls["n"] += 1
         if calls["n"] == 1:
-            return web.json_response({"error": "busy"}, status=429)
+            return web.json_response({"error": "busy"}, status=busy_status)
         return web.json_response({"choices": []})
 
     async def run():
@@ -123,5 +202,3 @@ def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
 
     asyncio.run(run())
     assert calls["n"] == 2
-
-

@@ -8480,6 +8480,7 @@ class AIAgent:
         durable_turn_lease_interrupt_message = None
         token = None
         acct_token = None
+        usage_ledger_token = None
         task_started = False
         task_finished = False
         relay_outcome = "failed"
@@ -8778,6 +8779,16 @@ class AIAgent:
                 getattr(self, "_session_db", None),
                 getattr(self, "session_id", None),
             )
+            try:
+                from agent.usage_ledger import set_usage_context
+
+                usage_ledger_token = set_usage_context(
+                    surface=task_context["platform"] or "cli",
+                    logical_run_id=relay_turn_id,
+                    max_iterations=getattr(self, "max_iterations", None),
+                )
+            except Exception:
+                logger.warning("Usage ledger context setup failed", exc_info=True)
             from agent.auxiliary_client import scoped_runtime_main
 
             # The outer token restores the caller's Context even though turn setup
@@ -8891,8 +8902,34 @@ class AIAgent:
                         pass
                     if getattr(self, "_relay_pending_turn_id", None) == relay_turn_id:
                         self._relay_pending_turn_id = None
+                    if usage_ledger_token is not None and relay_outcome != "success":
+                        try:
+                            from agent.usage_ledger import record_run_status
+
+                            record_run_status(
+                                session_id,
+                                model=getattr(self, "model", None),
+                                provider=getattr(self, "provider", None),
+                                task="logical_run",
+                                status="failed",
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Usage ledger run-status mirror failed",
+                                exc_info=True,
+                            )
                     if acct_token is not None:
                         reset_accounting_context(acct_token)
+                    if usage_ledger_token is not None:
+                        try:
+                            from agent.usage_ledger import reset_usage_context
+
+                            reset_usage_context(usage_ledger_token)
+                        except Exception:
+                            logger.warning(
+                                "Usage ledger context reset failed",
+                                exc_info=True,
+                            )
                     if token is not None:
                         reset_conversation_context(token)
 
