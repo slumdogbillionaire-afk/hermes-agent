@@ -35,10 +35,9 @@ logger = logging.getLogger(__name__)
 # generous ceiling so long tool-using turns aren't killed mid-flight.
 WAKE_TURN_TIMEOUT_SECONDS = 600.0
 
-# Backoff delays between retries on transient failures (429 concurrency cap,
-# connection errors). The API server has no per-session lock — concurrent
-# turns on one session are last-writer-wins — but it DOES enforce a global
-# max_concurrent_runs cap via HTTP 429, which is worth waiting out.
+# Backoff delays between retries on transient failures (409 session lease,
+# 429 concurrency cap, connection errors). API admission joins explicit
+# session ids to the gateway's canonical turn lease before transcript reads.
 _RETRY_DELAYS_SECONDS = (2.0, 5.0, 10.0)
 
 
@@ -142,11 +141,11 @@ async def _self_post_chat_completion(
             timeout = aiohttp.ClientTimeout(total=WAKE_TURN_TIMEOUT_SECONDS)
             async with aiohttp.ClientSession(timeout=timeout) as http:
                 async with http.post(url, json=payload, headers=headers) as resp:
-                    if resp.status == 429:
-                        # Global concurrency cap (max_concurrent_runs) —
-                        # transient; back off and retry.
+                    if resp.status in (409, 429):
+                        # Session lease or global concurrency cap — both are
+                        # transient; back off and retry without changing path.
                         last_err = RuntimeError(
-                            f"wake self-post got HTTP 429 (concurrency cap) "
+                            f"wake self-post got transient HTTP {resp.status} "
                             f"for session {session_id}"
                         )
                         logger.warning(

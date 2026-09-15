@@ -458,6 +458,16 @@ def fire_claim_fence(job_id: str, *, expected_owner: str):
 # updated lets an unsafe value (``../escape``, absolute path, nested) leak
 # into output writes/deletes.
 _IMMUTABLE_JOB_FIELDS = frozenset({"id"})
+MAX_JOB_ITERATIONS = 500
+
+
+def validate_job_max_iterations(value: Any) -> int:
+    """Return a safe per-job iteration limit or raise ``ValueError``."""
+    if type(value) is not int or not 1 <= value <= MAX_JOB_ITERATIONS:
+        raise ValueError(
+            f"max_iterations must be an integer between 1 and {MAX_JOB_ITERATIONS}"
+        )
+    return value
 
 
 def _job_output_dir(job_id: str) -> Path:
@@ -1797,6 +1807,7 @@ def create_job(
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
+    max_iterations: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1890,6 +1901,11 @@ def create_job(
     normalized_monitor_script = normalized_monitor_script or None
     normalized_monitor_url = str(monitor_url).strip() if isinstance(monitor_url, str) else None
     normalized_monitor_url = normalized_monitor_url or None
+    normalized_max_iterations = (
+        validate_job_max_iterations(max_iterations)
+        if max_iterations is not None
+        else None
+    )
 
     # Monitor-mode validation: exactly one source, and monitor mode only
     # makes sense when there IS an agent to suppress/wake.
@@ -1995,6 +2011,9 @@ def create_job(
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
+    # Preserve old jobs byte-for-byte when no override is requested.
+    if normalized_max_iterations is not None:
+        job["max_iterations"] = normalized_max_iterations
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -2092,6 +2111,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updates["workdir"] = None
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
+
+            if "max_iterations" in updates:
+                updates["max_iterations"] = validate_job_max_iterations(
+                    updates["max_iterations"]
+                )
 
             # Normalize monitor fields the same way create_job does (empty
             # string clears the field).

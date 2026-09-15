@@ -118,6 +118,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "monitors, incremental digests). First run is unchanged."
         ),
     )
+    cron_create.add_argument(
+        "--max-iterations",
+        type=int,
+        help="Bound this job to 1-500 agent iterations per fire; omit to use agent.max_turns.",
+    )
 
     # cron edit
     cron_edit = cron_subparsers.add_parser(
@@ -230,6 +235,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "--provider",
         dest="model_provider",
         help="Inference provider paired with --model. Pass empty string to clear.",
+    )
+    cron_edit.add_argument(
+        "--max-iterations",
+        type=int,
+        help="Set this job's per-fire agent iteration limit (1-500).",
     )
 
     # lifecycle actions
