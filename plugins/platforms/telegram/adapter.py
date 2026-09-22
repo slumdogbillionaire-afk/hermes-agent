@@ -5129,15 +5129,23 @@ class TelegramAdapter(BasePlatformAdapter):
     # Step-3 registry centralizes tier policy.
     _D065_STEWARD_ID = "7758316507"
     _D065_STEWARD_ONLY_KEYS = frozenset({"master.unfreeze"})
+    # Settings-wiring Step 4 (Ember's 2026-09-22 ruling: now, not deferred):
+    # every Control Panel setting change rides approvals as
+    # setting_change:<envelope id>, and is steward-only too — the first one
+    # wired is Adam's own off-the-record privacy switch.
+    _D065_STEWARD_ONLY_PREFIXES = ("setting_change:",)
 
     @staticmethod
     def _d065_may_approve(action_key: str, caller_id: str) -> bool:
         """Approve-authorization for a RESOLVED da: request. Steward-only keys
-        require Adam's exact user id and FAIL CLOSED on an absent/malformed
-        pin. Every other key keeps the existing general-allowlist policy (the
-        caller already passed _is_callback_user_authorized). Deny is never
-        gated here — refusing only keeps a guardrail up."""
-        if action_key not in TelegramAdapter._D065_STEWARD_ONLY_KEYS:
+        (exact keys, or any key with a steward-only prefix) require Adam's
+        exact user id and FAIL CLOSED on an absent/malformed pin. Every other
+        key keeps the existing general-allowlist policy (the caller already
+        passed _is_callback_user_authorized). Deny is never gated here —
+        refusing only keeps a guardrail up."""
+        key = str(action_key or "")
+        if (key not in TelegramAdapter._D065_STEWARD_ONLY_KEYS
+                and not key.startswith(TelegramAdapter._D065_STEWARD_ONLY_PREFIXES)):
             return True
         steward = str(TelegramAdapter._D065_STEWARD_ID or "").strip()
         if not steward.isdigit():
