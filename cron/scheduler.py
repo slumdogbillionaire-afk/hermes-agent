@@ -1186,6 +1186,10 @@ class _ReadWriteLock:
         self._readers = 0
         self._writer_active = False
         self._writers_waiting = 0
+        # Diagnostic only (#79768 follow-up) — never read for locking
+        # decisions, only surfaced in the reader timeout message so a stuck
+        # lock names its holder instead of leaving the cause a mystery.
+        self._writer_label: str | None = None
 
     def acquire_read(self, timeout: float | None = None) -> bool:
         """Acquire a read lock.
@@ -1216,11 +1220,13 @@ class _ReadWriteLock:
             if self._readers == 0:
                 self._cond.notify_all()
 
-    def acquire_write(self, timeout: float | None = None) -> bool:
+    def acquire_write(self, timeout: float | None = None, label: str | None = None) -> bool:
         """Acquire a write lock.
 
         Returns ``True`` if the lock was acquired, ``False`` on timeout.
         A timed-out caller proceeds without the lock (degraded mode).
+        ``label`` (e.g. ``"<job name> (<job id>)"``) is stored purely for
+        diagnostics — see ``current_writer_label()``.
         """
         deadline = (
             time.monotonic() + timeout if timeout is not None else None
@@ -1240,12 +1246,28 @@ class _ReadWriteLock:
             finally:
                 self._writers_waiting -= 1
             self._writer_active = True
+            self._writer_label = label
         return True
 
     def release_write(self) -> None:
         with self._cond:
             self._writer_active = False
+            self._writer_label = None
             self._cond.notify_all()
+
+    def current_writer_label(self) -> str | None:
+        """Best-effort snapshot of who (if anyone) holds the write lock.
+
+        Diagnostic only (#79768 follow-up): the label is set/cleared under
+        the same lock as ``_writer_active`` but this method takes a fresh,
+        very-short-held snapshot rather than the caller's own lock scope —
+        by the time a timeout is reported the holder may already have
+        changed or released, so this can read "no writer" even when the
+        timeout was caused by a writer that has since finished. Report it as
+        a hint, not a guarantee.
+        """
+        with self._cond:
+            return self._writer_label if self._writer_active else None
 
 
 # Serializes the per-job TERMINAL_CWD override against every other concurrently
@@ -5026,12 +5048,24 @@ def run_job(
     _holds_cwd_write = _job_workdir is not None
     _cwd_lock_timeout = _cwd_lock_timeout_seconds()
     _cwd_lock_acquired = True
+    _cwd_lock_label = f"{job.get('name', '?')} ({job_id})"
+    _cwd_lock_blocked_by: str | None = None
     if _holds_cwd_write:
-        if not _terminal_cwd_lock.acquire_write(timeout=_cwd_lock_timeout):
+        if not _terminal_cwd_lock.acquire_write(timeout=_cwd_lock_timeout, label=_cwd_lock_label):
             _cwd_lock_acquired = False
+            _cwd_lock_blocked_by = _terminal_cwd_lock.current_writer_label()
+        else:
+            # Diagnostic trail for the "no writer was active at timeout"
+            # case above — lets a later reader's failure be traced back to
+            # whichever writer held the lock around that time (#79768).
+            logger.info(
+                "Job '%s': acquired TERMINAL_CWD write lock (workdir=%s)",
+                job_id, _job_workdir,
+            )
     else:
         if not _terminal_cwd_lock.acquire_read(timeout=_cwd_lock_timeout):
             _cwd_lock_acquired = False
+            _cwd_lock_blocked_by = _terminal_cwd_lock.current_writer_label()
 
     # Everything after the acquire MUST live inside this try, so the finally
     # below always releases the lock even if the env override or any later
@@ -5049,14 +5083,22 @@ def run_job(
             # wrong-directory execution, the exact corruption the lock
             # exists to prevent. A loud failure is recoverable (next tick /
             # manual rerun); a job that ran in the wrong directory is not.
+            _holder_note = (
+                f" Writer at timeout: {_cwd_lock_blocked_by}."
+                if _cwd_lock_blocked_by
+                else " No writer was active at the moment of timeout (likely "
+                "a reader pile-up, or the writer released just before this "
+                "check) — see agent.log around this timestamp for the last "
+                "job that acquired the write lock."
+            )
             raise TimeoutError(
                 f"Timed out waiting for the TERMINAL_CWD "
                 f"{'write' if _holds_cwd_write else 'read'} lock after "
                 f"{_cwd_lock_timeout:.0f}s — another cron job (a workdir "
                 f"writer, or long-running readers) has held it for longer "
-                f"than the cron inactivity limit. If a workdir job is the "
-                f"holder, stagger its schedule or remove its workdir to "
-                f"unblock this job (#79768)."
+                f"than the cron inactivity limit.{_holder_note} If a workdir "
+                f"job is the holder, stagger its schedule or remove its "
+                f"workdir to unblock this job (#79768)."
             )
         # Scope cron approval policy to this job. Keep the token so the finally
         # restores the pre-job state instead of pinning an explicit empty value,
